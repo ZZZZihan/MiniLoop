@@ -1,0 +1,13 @@
+title = "MiniLoop Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow deterministic test sentinel fake keys and example placeholders"
+regexes = [
+    '''test-miniloop-fake-key-[A-Za-z0-9_-]*''',
+]
+paths = [
+    '''^\.env\.example$''',
+]
