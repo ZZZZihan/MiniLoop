@@ -1,0 +1,21 @@
+{
+  "case_id": "case_04_csv_quoting",
+  "split": "test",
+  "title": "Parse comma-separated key=value pairs with double-quoted values containing commas",
+  "task_prompt": "Fix the bug in `src/kv_parser.py` so that all tests in `tests/test_kv_parser.py` pass. You may only modify `src/kv_parser.py`.",
+  "editable_files": [
+    "src/kv_parser.py"
+  ],
+  "protected_test_files": [
+    "tests/test_kv_parser.py"
+  ],
+  "test_command": [
+    "pytest",
+    "-q"
+  ],
+  "reference_fix": {
+    "path": "src/kv_parser.py",
+    "old_str": "    for part in line.split(\",\"):\n        if \"=\" not in part:\n            raise ValueError(f\"Missing '=' in segment: {part!r}\")\n        key, raw_val = part.split(\"=\", 1)\n        key = key.strip()\n        if not key:\n            raise ValueError(\"Key must not be empty\")\n        result[key] = raw_val.strip()",
+    "new_str": "    segments: list[str] = []\n    buf: list[str] = []\n    in_quotes = False\n    i = 0\n    while i < len(line):\n        ch = line[i]\n        if ch == \"\\\\\" and in_quotes and i + 1 < len(line):\n            buf.append(ch)\n            buf.append(line[i + 1])\n            i += 2\n            continue\n        if ch == '\"':\n            in_quotes = not in_quotes\n            buf.append(ch)\n        elif ch == \",\" and not in_quotes:\n            segments.append(\"\".join(buf))\n            buf = []\n        else:\n            buf.append(ch)\n        i += 1\n    if in_quotes:\n        raise ValueError(\"Unclosed double quote in line\")\n    segments.append(\"\".join(buf))\n\n    for part in segments:\n        if \"=\" not in part:\n            raise ValueError(f\"Missing '=' in segment: {part!r}\")\n        key, raw_val = part.split(\"=\", 1)\n        key = key.strip()\n        if not key:\n            raise ValueError(\"Key must not be empty\")\n        val = raw_val.strip()\n        if len(val) >= 2 and val.startswith('\"') and val.endswith('\"'):\n            val = val[1:-1].replace('\\\\\"', '\"').replace('\"\"', '\"')\n        result[key] = val"
+  }
+}

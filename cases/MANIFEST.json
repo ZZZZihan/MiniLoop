@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "case_count": 6,
+  "splits": {
+    "dev": [
+      "case_01_off_by_one",
+      "case_02_none_guard"
+    ],
+    "test": [
+      "case_03_date_window",
+      "case_04_csv_quoting",
+      "case_05_retry_backoff",
+      "case_06_lru_eviction"
+    ]
+  },
+  "files": {
+    "case_01_off_by_one/case.json": "3b20b55758e7762477d720bbb6c47126c79dedca348dcbc3e6fb0f4f23186738",
+    "case_01_off_by_one/src/paginator.py": "27da9fe3c4634adf7e54b0010c838ef5d49d3fcbc7f66fcda2ccbfcef2c8be7f",
+    "case_01_off_by_one/tests/test_paginator.py": "c6abe098835dbe78ac7bf87f3422fdf89dfe93ae005d45d8275f3ef51e13ec74",
+    "case_02_none_guard/case.json": "95a3b736d83538568307304be174ca2543ae235a4dfa793f3564d7cfa72f0145",
+    "case_02_none_guard/src/config_merge.py": "2c342f4f9f83fee04b33bf9dfb1bf872e2f84c155bad2926a44af32d072b2e97",
+    "case_02_none_guard/tests/test_config_merge.py": "ad54425b75f7737cb5fc132d888dd2404aa1ba3c8840c5eaf39ad7536cbf51c8",
+    "case_03_date_window/case.json": "a7c43e5349d99f65adab8459e95aae7699cb381b7470529b987e651f2b90641c",
+    "case_03_date_window/src/window_counter.py": "f08cf17c61839f0eb94cada78ae390f28f040c81fbc3d117ef5863450c15dd0f",
+    "case_03_date_window/tests/test_window_counter.py": "ddbf63511df8e50532060b9199e9eb14d71767a08af7b4d72ae2c30d218242e8",
+    "case_04_csv_quoting/case.json": "a5a7d03d7d1ff41579789d7ecf9344344ff3832a1a5bf35fbb24775fa41bb325",
+    "case_04_csv_quoting/src/kv_parser.py": "c7b2bf6c42a9fff1166b5a6b65f8f00468b580f46f0a29f79f1a0b2bcce24ee6",
+    "case_04_csv_quoting/tests/test_kv_parser.py": "de87ec28f3b8bf8b3244f0eda41e5308ed0bba4c2b24826a422bcba755a63c3c",
+    "case_05_retry_backoff/case.json": "b0d19117a71f2e1bacb652f286d1fd5ee2e60d4dcd059d0bbede4d372ec31a34",
+    "case_05_retry_backoff/src/backoff.py": "64ac38b50902fda445d699cf594424cfe2e0c41a49b837a1a93730e3353c0816",
+    "case_05_retry_backoff/tests/test_backoff.py": "5c54fbd021bc563ab3b1bc744a00b1063e7e577fc5b14d8822b5549fec7192b1",
+    "case_06_lru_eviction/case.json": "28189382181d5e11c2f7749e0345f82b540c3352b0c111c4a87f19367f879ccb",
+    "case_06_lru_eviction/src/simple_lru.py": "c2fd4b471e3b0302b2c44ece178e72168a17c3957af2672fa59decd13f9159ec",
+    "case_06_lru_eviction/tests/test_simple_lru.py": "f127351e5c975dae8cbe17aaefd464de95e3ac6dd57bb75505afd470240e4365"
+  }
+}

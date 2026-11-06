@@ -1,0 +1,21 @@
+{
+  "case_id": "case_06_lru_eviction",
+  "split": "test",
+  "title": "Refresh key recency on get() and existing-key put() in SimpleLRU",
+  "task_prompt": "Fix the bug in `src/simple_lru.py` so that all tests in `tests/test_simple_lru.py` pass. You may only modify `src/simple_lru.py`.",
+  "editable_files": [
+    "src/simple_lru.py"
+  ],
+  "protected_test_files": [
+    "tests/test_simple_lru.py"
+  ],
+  "test_command": [
+    "pytest",
+    "-q"
+  ],
+  "reference_fix": {
+    "path": "src/simple_lru.py",
+    "old_str": "    def get(self, key: K, default: V | None = None) -> V | None:\n        \"\"\"Return the value for key if present and mark it as most recently used.\"\"\"\n        if key not in self._store:\n            return default\n        return self._store[key]\n\n    def put(self, key: K, value: V) -> None:\n        \"\"\"Insert or update key with value, evicting the least recently used item if full.\"\"\"\n        if key in self._store:\n            self._store[key] = value\n            return",
+    "new_str": "    def get(self, key: K, default: V | None = None) -> V | None:\n        \"\"\"Return the value for key if present and mark it as most recently used.\"\"\"\n        if key not in self._store:\n            return default\n        self._store.move_to_end(key)\n        return self._store[key]\n\n    def put(self, key: K, value: V) -> None:\n        \"\"\"Insert or update key with value, evicting the least recently used item if full.\"\"\"\n        if key in self._store:\n            self._store[key] = value\n            self._store.move_to_end(key)\n            return"
+  }
+}

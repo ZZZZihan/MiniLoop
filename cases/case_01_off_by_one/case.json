@@ -1,0 +1,21 @@
+{
+  "case_id": "case_01_off_by_one",
+  "split": "dev",
+  "title": "1-based pagination slice offset and empty page validation",
+  "task_prompt": "Fix the bug in `src/paginator.py` so that all tests in `tests/test_paginator.py` pass. You may only modify `src/paginator.py`.",
+  "editable_files": [
+    "src/paginator.py"
+  ],
+  "protected_test_files": [
+    "tests/test_paginator.py"
+  ],
+  "test_command": [
+    "pytest",
+    "-q"
+  ],
+  "reference_fix": {
+    "path": "src/paginator.py",
+    "old_str": "    start = page * page_size",
+    "new_str": "    start = (page - 1) * page_size"
+  }
+}
