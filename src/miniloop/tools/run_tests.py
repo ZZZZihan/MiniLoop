@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -115,6 +116,14 @@ def _build_clean_test_env(
     return clean_env
 
 
+def _kill_process_group(pid: int) -> None:
+    """Kill all processes in the process group led by `pid`, ignoring already-exited groups."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def build_run_tests_tool(
     workspace_root: Path,
     *,
@@ -138,16 +147,30 @@ def build_run_tests_tool(
         clean_env = _build_clean_test_env(root)
 
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 list(cmd_tuple),
                 cwd=root,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_sec,
                 env=clean_env,
-                check=False,
+                start_new_session=True,
             )
+        except OSError as exc:
+            raise ToolExecutionError(
+                "test_execution_failed",
+                f"Failed to execute test command: {exc}",
+            ) from exc
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_sec)
         except subprocess.TimeoutExpired as exc:
+            _kill_process_group(proc.pid)
+            proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
             if frozen_hashes is not None:
                 post_timeout_violation = verify_file_hashes(root, frozen_hashes)
                 if post_timeout_violation is not None:
@@ -156,11 +179,8 @@ def build_run_tests_tool(
                         post_timeout_violation,
                     ) from exc
             raise TimeoutError(f"Test command timed out after {timeout_sec:.2f}s") from exc
-        except OSError as exc:
-            raise ToolExecutionError(
-                "test_execution_failed",
-                f"Failed to execute test command: {exc}",
-            ) from exc
+
+        _kill_process_group(proc.pid)
 
         if frozen_hashes is not None:
             post_violation = verify_file_hashes(root, frozen_hashes)
@@ -169,10 +189,10 @@ def build_run_tests_tool(
 
         passed = proc.returncode == 0
         sections: list[str] = []
-        if proc.stdout:
-            sections.append(proc.stdout.rstrip())
-        if proc.stderr:
-            sections.append(f"[stderr]\n{proc.stderr.rstrip()}")
+        if stdout:
+            sections.append(stdout.rstrip())
+        if stderr:
+            sections.append(f"[stderr]\n{stderr.rstrip()}")
         combined = "\n".join(sections).strip()
         if len(combined) > max_output_chars:
             combined = combined[:max_output_chars] + "\n...[truncated]"

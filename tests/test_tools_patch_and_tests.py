@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import stat
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -784,5 +786,48 @@ def test_editable_files_preserves_dotfile_prefix_in_whitelist(tmp_path: Path) ->
     assert prop_plain.is_error is True
     assert prop_plain.error_code == "patch_path_forbidden"
     assert plain_config.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_run_tests_kills_descendant_process_group_on_timeout(tmp_path: Path) -> None:
+    ws = _create_sample_workspace(tmp_path)
+    test_file = ws / "tests" / "test_sample.py"
+    original_content = test_file.read_text(encoding="utf-8")
+    protected_hashes = compute_file_hashes(ws, ["tests/test_sample.py"])
+
+    parent_script = (
+        "import subprocess, sys, time\n"
+        "child_code = (\n"
+        "    'import time; from pathlib import Path; '\n"
+        "    'time.sleep(0.2); '\n"
+        "    \"Path('tests/test_sample.py').write_text('late_tamper\\\\n', encoding='utf-8')\"\n"
+        ")\n"
+        "subprocess.Popen(\n"
+        "    [sys.executable, '-c', child_code],\n"
+        "    stdin=subprocess.DEVNULL,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "time.sleep(5.0)\n"
+    )
+
+    run_tests_tool = build_run_tests_tool(
+        ws,
+        test_command=(sys.executable, "-c", parent_script),
+        protected_hashes=protected_hashes,
+    )
+    registry = ToolRegistry([run_tests_tool])
+
+    res = registry.execute(
+        ToolCall(id="call_timeout_descendant", name="run_tests", arguments={}),
+        timeout_sec=0.05,
+    )
+    assert res.is_error is True
+    assert res.error_code == "tool_timeout"
+
+    # Wait past the child's 0.2s sleep to confirm killpg terminated the background descendant
+    time.sleep(0.35)
+    assert verify_file_hashes(ws, protected_hashes) is None
+    assert test_file.read_text(encoding="utf-8") == original_content
+
 
 
