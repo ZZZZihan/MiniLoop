@@ -153,6 +153,8 @@ def build_run_tests_tool(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=clean_env,
                 start_new_session=True,
             )
@@ -165,6 +167,8 @@ def build_run_tests_tool(
         try:
             stdout, stderr = proc.communicate(timeout=timeout_sec)
         except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"Test command timed out after {timeout_sec:.2f}s") from exc
+        finally:
             _kill_process_group(proc.pid)
             proc.wait()
             if proc.stdout is not None:
@@ -172,20 +176,9 @@ def build_run_tests_tool(
             if proc.stderr is not None:
                 proc.stderr.close()
             if frozen_hashes is not None:
-                post_timeout_violation = verify_file_hashes(root, frozen_hashes)
-                if post_timeout_violation is not None:
-                    raise ToolExecutionError(
-                        "protected_test_modified",
-                        post_timeout_violation,
-                    ) from exc
-            raise TimeoutError(f"Test command timed out after {timeout_sec:.2f}s") from exc
-
-        _kill_process_group(proc.pid)
-
-        if frozen_hashes is not None:
-            post_violation = verify_file_hashes(root, frozen_hashes)
-            if post_violation is not None:
-                raise ToolExecutionError("protected_test_modified", post_violation)
+                post_violation = verify_file_hashes(root, frozen_hashes)
+                if post_violation is not None:
+                    raise ToolExecutionError("protected_test_modified", post_violation)
 
         passed = proc.returncode == 0
         sections: list[str] = []

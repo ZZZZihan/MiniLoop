@@ -830,4 +830,53 @@ def test_run_tests_kills_descendant_process_group_on_timeout(tmp_path: Path) -> 
     assert test_file.read_text(encoding="utf-8") == original_content
 
 
+def test_run_tests_handles_non_utf8_output_and_still_detects_protected_file_tamper(
+    tmp_path: Path,
+) -> None:
+    ws = _create_sample_workspace(tmp_path)
+    protected_hashes = compute_file_hashes(ws, ["tests/test_sample.py"])
+
+    non_utf8_ok_script = (
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfebinary-stdout-ok\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    ok_tool = build_run_tests_tool(
+        ws,
+        test_command=(sys.executable, "-c", non_utf8_ok_script),
+        protected_hashes=protected_hashes,
+    )
+    ok_registry = ToolRegistry([ok_tool])
+    ok_res = ok_registry.execute(
+        ToolCall(id="call_non_utf8_ok", name="run_tests", arguments={}),
+        timeout_sec=5.0,
+    )
+    assert ok_res.is_error is False
+    assert ok_res.error_code is None
+    assert "exit_code: 0" in ok_res.content
+    assert "passed: true" in ok_res.content
+    assert "��binary-stdout-ok" in ok_res.content
+
+    non_utf8_tamper_script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfe')\n"
+        "sys.stdout.flush()\n"
+        "Path('tests/test_sample.py').write_text('tampered\\n', encoding='utf-8')\n"
+    )
+    tamper_tool = build_run_tests_tool(
+        ws,
+        test_command=(sys.executable, "-c", non_utf8_tamper_script),
+        protected_hashes=protected_hashes,
+    )
+    tamper_registry = ToolRegistry([tamper_tool])
+    tamper_res = tamper_registry.execute(
+        ToolCall(id="call_non_utf8_tamper", name="run_tests", arguments={}),
+        timeout_sec=5.0,
+    )
+    assert tamper_res.is_error is True
+    assert tamper_res.error_code == "protected_test_modified"
+
+
+
 
