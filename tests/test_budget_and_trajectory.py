@@ -181,6 +181,47 @@ def test_sanitize_payload_redacts_secrets_in_mapping_keys() -> None:
     assert sentinel_secret not in json.dumps(cleaned)
 
 
+def test_sanitize_payload_redacts_token_suffix_keys_while_preserving_token_counts() -> None:
+    cleaned = sanitize_payload(
+        {
+            "refresh_token": "rt-123",
+            "id_token": "idt-456",
+            "session_token": "st-789",
+            "prompt_tokens": 42,
+        }
+    )
+    assert cleaned == {
+        "refresh_token": REDACTED,
+        "id_token": REDACTED,
+        "session_token": REDACTED,
+        "prompt_tokens": 42,
+    }
+
+
+def test_replay_trajectory_preserves_unicode_line_separators(tmp_path: Path) -> None:
+    traj_path = tmp_path / "runs" / "unicode_ls.jsonl"
+    recorder = TrajectoryRecorder(traj_path, run_id="run_unicode_ls")
+    unicode_task = f"line1{chr(0x2028)}line2{chr(0x2029)}line3"
+    unicode_answer = f"done{chr(0x2028)}ok"
+
+    recorder.record("run_start", {"task": unicode_task})
+    recorder.record(
+        "run_end",
+        {
+            "exit_reason": "completed",
+            "final_answer": unicode_answer,
+            "model_calls": 1,
+            "tool_calls": 0,
+        },
+    )
+
+    report = replay_trajectory(traj_path)
+    assert len(report.events) == 2
+    assert report.events[0].payload["task"] == unicode_task
+    assert report.final_answer == unicode_answer
+    assert report.exit_reason == ExitReason.COMPLETED
+
+
 def test_trajectory_recorder_does_not_advance_sequence_on_failed_write(
     tmp_path: Path,
 ) -> None:

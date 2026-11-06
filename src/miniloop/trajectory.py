@@ -39,6 +39,10 @@ _SENSITIVE_KEY_SUBSTRINGS: tuple[str, ...] = (
     "password",
     "access_token",
     "auth_token",
+    "refresh_token",
+    "id_token",
+    "client_secret",
+    "private_key",
 )
 
 _BEARER_PATTERN = re.compile(r"(?i)(Bearer\s+)\S+")
@@ -78,7 +82,7 @@ class ReplayReport:
 
 def _is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
-    if lowered == "token":
+    if lowered == "token" or lowered.endswith("_token") or lowered.endswith("-token"):
         return True
     return any(marker in lowered for marker in _SENSITIVE_KEY_SUBSTRINGS)
 
@@ -212,7 +216,9 @@ def replay_trajectory(path: Path) -> ReplayReport:
     except (OSError, UnicodeDecodeError) as exc:
         raise TrajectoryCorruptedError(f"empty_or_missing_trajectory: {exc}") from exc
 
-    raw_lines = raw_text.splitlines()
+    raw_lines = [line.rstrip("\r") for line in raw_text.split("\n")]
+    if raw_lines and raw_lines[-1] == "":
+        raw_lines.pop()
     if not any(line.strip() for line in raw_lines):
         raise TrajectoryCorruptedError("empty_or_missing_trajectory: trajectory file is empty")
 
