@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 import pytest
@@ -696,4 +697,92 @@ def test_patch_rejects_lone_surrogate_utf8_and_preserves_original_file(
     assert target.read_text(encoding="utf-8") == original_content
     assert file_sha256(target) == original_sha
     assert list(target.parent.glob(".miniloop_patch_*")) == []
+
+
+def test_apply_patch_preserves_file_permission_mode(tmp_path: Path) -> None:
+    ws = _create_sample_workspace(tmp_path)
+    script = ws / "src" / "run.sh"
+    script.write_text("#!/usr/bin/env bash\necho old\n", encoding="utf-8")
+    script.chmod(0o755)
+    assert stat.S_IMODE(script.stat().st_mode) == 0o755
+
+    store = PatchStore(ws, editable_files=frozenset({"src/run.sh"}))
+    propose_tool, apply_tool = build_patch_tools(store)
+    registry = ToolRegistry([propose_tool, apply_tool])
+
+    prop_res = registry.execute(
+        ToolCall(
+            id="c_prop_mode",
+            name="propose_patch",
+            arguments={
+                "path": "src/run.sh",
+                "old_str": "echo old\n",
+                "new_str": "echo new\n",
+            },
+        )
+    )
+    assert prop_res.is_error is False
+
+    app_res = registry.execute(
+        ToolCall(
+            id="c_app_mode",
+            name="apply_patch",
+            arguments={"patch_id": "patch_0001"},
+        )
+    )
+    assert app_res.is_error is False
+    assert script.read_text(encoding="utf-8") == "#!/usr/bin/env bash\necho new\n"
+    assert stat.S_IMODE(script.stat().st_mode) == 0o755
+
+
+def test_editable_files_preserves_dotfile_prefix_in_whitelist(tmp_path: Path) -> None:
+    ws = _create_sample_workspace(tmp_path)
+    dot_config = ws / ".config.py"
+    plain_config = ws / "config.py"
+    dot_config.write_text("VALUE = 1\n", encoding="utf-8")
+    plain_config.write_text("VALUE = 1\n", encoding="utf-8")
+
+    store = PatchStore(ws, editable_files={".config.py"})
+    propose_tool, apply_tool = build_patch_tools(store)
+    registry = ToolRegistry([propose_tool, apply_tool])
+
+    # Allowed: .config.py is in editable_files
+    prop_dot = registry.execute(
+        ToolCall(
+            id="c_prop_dot",
+            name="propose_patch",
+            arguments={
+                "path": ".config.py",
+                "old_str": "VALUE = 1",
+                "new_str": "VALUE = 2",
+            },
+        )
+    )
+    assert prop_dot.is_error is False
+    app_dot = registry.execute(
+        ToolCall(
+            id="c_app_dot",
+            name="apply_patch",
+            arguments={"patch_id": "patch_0001"},
+        )
+    )
+    assert app_dot.is_error is False
+    assert dot_config.read_text(encoding="utf-8") == "VALUE = 2\n"
+
+    # Rejected: config.py (without leading dot) is NOT in editable_files
+    prop_plain = registry.execute(
+        ToolCall(
+            id="c_prop_plain",
+            name="propose_patch",
+            arguments={
+                "path": "config.py",
+                "old_str": "VALUE = 1",
+                "new_str": "VALUE = 2",
+            },
+        )
+    )
+    assert prop_plain.is_error is True
+    assert prop_plain.error_code == "patch_path_forbidden"
+    assert plain_config.read_text(encoding="utf-8") == "VALUE = 1\n"
+
 

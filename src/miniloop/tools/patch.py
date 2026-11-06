@@ -5,10 +5,11 @@ from __future__ import annotations
 import difflib
 import hashlib
 import os
+import stat
 import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from miniloop.tools.read_file import resolve_workspace_path
@@ -66,11 +67,62 @@ def file_sha256(path: Path) -> str:
 
 def _is_protected_test_path(rel_path: str) -> bool:
     """Return True if a workspace-relative POSIX path points to a test file or directory."""
-    parts = Path(rel_path).parts
+    parts = PurePosixPath(rel_path).parts
     if any(part == "tests" for part in parts):
         return True
-    filename = Path(rel_path).name
+    filename = PurePosixPath(rel_path).name
     return filename.startswith("test_") or filename.endswith("_test.py")
+
+
+def _normalize_editable_path(raw: str) -> str:
+    """Normalize a workspace-relative editable file entry without stripping dotfile prefixes."""
+    s = raw.strip()
+    while s.startswith("./"):
+        s = s[2:]
+    norm = PurePosixPath(s).as_posix()
+    if not norm or norm == "." or norm.startswith("/") or ".." in PurePosixPath(norm).parts:
+        raise ValueError(f"Invalid workspace-relative editable file path: {raw!r}")
+    return norm
+
+
+def _atomic_write_utf8(target: Path, content: str) -> None:
+    """Atomically write UTF-8 text to `target` while preserving its permission bits."""
+    try:
+        encoded_bytes = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ToolExecutionError(
+            "invalid_patch_content",
+            "Replacement content is not valid UTF-8",
+        ) from exc
+
+    tmp_path: Path | None = None
+    replaced = False
+    try:
+        orig_mode = stat.S_IMODE(target.stat().st_mode)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=".miniloop_patch_",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            tmp_file.write(encoded_bytes)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_path, orig_mode)
+        os.replace(tmp_path, target)
+        replaced = True
+    except OSError as exc:
+        raise ToolExecutionError(
+            "file_write_error",
+            f"Failed to write '{target.name}': {exc}",
+        ) from exc
+    finally:
+        if not replaced and tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class PatchStore:
@@ -84,7 +136,7 @@ class PatchStore:
     ) -> None:
         self.workspace_root: Path = workspace_root.resolve()
         self.editable_files: frozenset[str] | None = (
-            frozenset(Path(p).as_posix().lstrip("./") for p in editable_files)
+            frozenset(_normalize_editable_path(p) for p in editable_files)
             if editable_files is not None
             else None
         )
@@ -107,7 +159,7 @@ class PatchStore:
         """Validate and stage a patch without modifying the target file on disk."""
         target = resolve_workspace_path(self.workspace_root, path)
         norm_rel = target.relative_to(self.workspace_root).as_posix()
-        raw_norm = Path(path).as_posix().lstrip("./")
+        raw_norm = PurePosixPath(path).as_posix()
 
         if (
             _is_protected_test_path(norm_rel)
@@ -269,40 +321,7 @@ class PatchStore:
                 f"Target file '{proposal.rel_path}' changed since patch '{patch_id}' was proposed",
             )
 
-        try:
-            encoded_bytes = proposal.new_content.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ToolExecutionError(
-                "invalid_patch_content",
-                "Replacement content is not valid UTF-8",
-            ) from exc
-
-        tmp_path: Path | None = None
-        replaced = False
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=target.parent,
-                prefix=".miniloop_patch_",
-                delete=False,
-            ) as tmp_file:
-                tmp_path = Path(tmp_file.name)
-                tmp_file.write(encoded_bytes)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
-            os.replace(tmp_path, target)
-            replaced = True
-        except OSError as exc:
-            raise ToolExecutionError(
-                "file_write_error",
-                f"Failed to write '{proposal.rel_path}': {exc}",
-            ) from exc
-        finally:
-            if not replaced and tmp_path is not None:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        _atomic_write_utf8(target, proposal.new_content)
 
         for other_id, other in self._proposals.items():
             if (
