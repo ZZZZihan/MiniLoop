@@ -28,7 +28,7 @@ _SENSITIVE_KEYS: frozenset[str] = frozenset(
         "bearer",
     }
 )
-_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+\S+")
+_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s'\"]+")
 
 
 class ModelAdapterError(RuntimeError):
@@ -49,8 +49,14 @@ class ModelAdapterError(RuntimeError):
 class ProtocolViolationError(RuntimeError):
     """Raised when the model response or tool message violates the tool-calling protocol."""
 
-    def __init__(self, message: str, *, attempts: int = 1) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int = 1,
+        secret: str = "",
+    ) -> None:
+        super().__init__(_scrub_text(message, secret))
         self.attempts: int = attempts
 
 
@@ -154,8 +160,9 @@ def _validate_tool_calls_list(tool_calls: Sequence[ToolCall], *, attempts: int =
                 "tool_call missing non-empty string 'id'", attempts=attempts
             )
         if tc.id in seen_ids:
+            safe_id = _scrub_text(tc.id)
             raise ProtocolViolationError(
-                f"Duplicate tool_call id in single turn: {tc.id!r}", attempts=attempts
+                f"Duplicate tool_call id in single turn: {safe_id!r}", attempts=attempts
             )
         seen_ids.add(tc.id)
         if not isinstance(tc.name, str) or not tc.name.strip():
@@ -344,9 +351,11 @@ class OpenAICompatibleAdapter:
                         attempts=attempt,
                     )
                 if call_id in seen_ids:
+                    safe_call_id = _scrub_text(call_id, secret_plain)
                     raise ProtocolViolationError(
-                        f"Duplicate tool_call id in single turn: {call_id!r}",
+                        f"Duplicate tool_call id in single turn: {safe_call_id!r}",
                         attempts=attempt,
+                        secret=secret_plain,
                     )
                 seen_ids.add(call_id)
 

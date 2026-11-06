@@ -443,6 +443,50 @@ def test_sentinel_secret_never_leaks_in_exceptions_or_raw_response() -> None:
     finally:
         err_client.close()
 
+    def leaking_duplicate_call_id_handler(request: httpx.Request) -> httpx.Response:
+        leaked_id = f"call-{SENTINEL_SECRET}-Bearer {SENTINEL_SECRET}"
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-dup-leak",
+                "model": "claude-sonnet-5-5",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": leaked_id,
+                                    "type": "function",
+                                    "function": {"name": "read_file", "arguments": "{}"},
+                                },
+                                {
+                                    "id": leaked_id,
+                                    "type": "function",
+                                    "function": {"name": "read_file", "arguments": "{}"},
+                                },
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+
+    dup_adapter, dup_client = _make_mock_adapter(
+        leaking_duplicate_call_id_handler,
+        api_key=SENTINEL_SECRET,
+    )
+    try:
+        with pytest.raises(ProtocolViolationError) as dup_exc_info:
+            dup_adapter.generate([Message(role="user", content="hi")], [], timeout_sec=1.0)
+        assert SENTINEL_SECRET not in str(dup_exc_info.value)
+        assert SENTINEL_SECRET not in repr(dup_exc_info.value)
+        assert "[REDACTED]" in str(dup_exc_info.value)
+    finally:
+        dup_client.close()
+
 
 @pytest.mark.parametrize(
     ("bad_payload", "expected_match"),
