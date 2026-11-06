@@ -252,3 +252,52 @@ def test_cli_eval_fake_and_missing_real_config_rejection(
         ]
     )
     assert bad_code == 1
+
+
+def test_import_time_os_exit_spoofing_passed_stdout_is_rejected(tmp_path: Path) -> None:
+    """Verify source code spoofing '1 passed' and calling os._exit(0) fails JUnit XML check."""
+    case = load_cases(split="dev")[0]
+    ws_dir = tmp_path / "spoof_exit_ws"
+    expected_hashes = prepare_isolated_workspace(case, ws_dir)
+
+    src_file = ws_dir / case.reference_fix.path
+    src_file.write_text(
+        'import os, sys\nprint("1 passed", flush=True)\nos._exit(0)\n',
+        encoding="utf-8",
+    )
+
+    verdict = evaluate_repaired_workspace(case, ws_dir, expected_hashes)
+    assert verdict.exit_code == 0
+    assert verdict.tests_passed is False
+    assert verdict.repair_succeeded is False
+    assert verdict.failure_reason == "tests_failed"
+
+
+def test_runtime_unauthorized_file_created_during_post_eval_test_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verify unauthorized files written at import/test time during evaluation are caught."""
+    case = load_cases(split="dev")[0]
+    ws_dir = tmp_path / "runtime_unauth_ws"
+    expected_hashes = prepare_isolated_workspace(case, ws_dir)
+
+    src_file = ws_dir / case.reference_fix.path
+    fixed_source = src_file.read_text(encoding="utf-8").replace(
+        case.reference_fix.old_str,
+        case.reference_fix.new_str,
+        1,
+    )
+    src_file.write_text(
+        fixed_source
+        + "\nfrom pathlib import Path\n"
+        + 'Path("unauthorized_runtime.txt").write_text("x", encoding="utf-8")\n',
+        encoding="utf-8",
+    )
+
+    verdict = evaluate_repaired_workspace(case, ws_dir, expected_hashes)
+    assert verdict.tests_passed is True
+    assert verdict.test_files_intact is True
+    assert verdict.only_allowed_files_modified is False
+    assert verdict.repair_succeeded is False
+    assert verdict.failure_reason == "disallowed_file_modified"
+

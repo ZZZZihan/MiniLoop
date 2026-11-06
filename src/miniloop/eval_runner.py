@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -292,6 +294,62 @@ def _inspect_workspace_files(
     return only_allowed, tuple(sorted(modified))
 
 
+def _verify_junit_xml(
+    junit_path: Path,
+    protected_test_files: Sequence[str],
+) -> bool:
+    """Verify external JUnit XML confirms all protected test files collected and passed."""
+    if not junit_path.is_file():
+        return False
+    try:
+        root = ET.parse(junit_path).getroot()
+        if root.tag == "testsuite":
+            suites = [root]
+        elif root.tag == "testsuites":
+            suites = list(root.findall("testsuite"))
+        else:
+            return False
+
+        if not suites:
+            return False
+
+        total_tests = sum(int(s.attrib.get("tests", 0)) for s in suites)
+        total_failures = sum(int(s.attrib.get("failures", 0)) for s in suites)
+        total_errors = sum(int(s.attrib.get("errors", 0)) for s in suites)
+        total_skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
+        testcases = [tc for s in suites for tc in s.findall("testcase")]
+    except (ET.ParseError, OSError, ValueError):
+        return False
+
+    if (
+        total_tests <= 0
+        or len(testcases) != total_tests
+        or total_failures != 0
+        or total_errors != 0
+        or total_skipped != 0
+    ):
+        return False
+
+    for tc in testcases:
+        for bad_tag in ("failure", "error", "skipped"):
+            if tc.find(bad_tag) is not None:
+                return False
+
+    classnames = [tc.attrib.get("classname", "") for tc in testcases]
+    for rel_path in protected_test_files:
+        mod_full = Path(rel_path).with_suffix("").as_posix().replace("/", ".")
+        mod_stem = Path(rel_path).stem
+        if not any(
+            cn in {mod_full, mod_stem}
+            or cn.startswith(f"{mod_full}.")
+            or cn.startswith(f"{mod_stem}.")
+            for cn in classnames
+        ):
+            return False
+
+    return True
+
+
 def evaluate_repaired_workspace(
     case: RepairCase,
     workspace_dir: Path,
@@ -312,57 +370,68 @@ def evaluate_repaired_workspace(
         }
 
     pre_test_intact = _check_test_hashes(workspace_root, resolved_test_hashes)
-    only_allowed, modified_files = _inspect_workspace_files(case, workspace_root)
+    pre_only_allowed, _ = _inspect_workspace_files(case, workspace_root)
 
     clean_env = _build_clean_test_env(workspace_root)
     timed_out = False
-    try:
-        proc = subprocess.Popen(
-            list(case.test_command),
-            cwd=workspace_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=clean_env,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        exit_code = -1
-        test_output = f"Independent test execution failed to start: {exc}"
-    else:
+    with tempfile.TemporaryDirectory(prefix="miniloop_eval_junit_") as tmp_dir:
+        junit_path = Path(tmp_dir) / "junit.xml"
+        cmd = list(case.test_command)
+        if cmd and Path(cmd[0]).name.startswith("pytest"):
+            cmd.append(f"--junitxml={junit_path}")
+
         try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=workspace_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=clean_env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            exit_code = -1
+            test_output = f"Independent test execution failed to start: {exc}"
+        else:
             try:
-                stdout, stderr = proc.communicate(timeout=timeout_sec)
-                exit_code = proc.returncode
-                out_parts: list[str] = []
-                if stdout:
-                    out_parts.append(stdout.rstrip())
-                if stderr:
-                    out_parts.append(stderr.rstrip())
-                test_output = "\n".join(out_parts).strip()
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                exit_code = -1
-                test_output = f"Independent test execution timed out after {timeout_sec:.2f}s"
+                try:
+                    stdout, stderr = proc.communicate(timeout=timeout_sec)
+                    exit_code = proc.returncode
+                    out_parts: list[str] = []
+                    if stdout:
+                        out_parts.append(stdout.rstrip())
+                    if stderr:
+                        out_parts.append(stderr.rstrip())
+                    test_output = "\n".join(out_parts).strip()
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    exit_code = -1
+                    test_output = f"Independent test execution timed out after {timeout_sec:.2f}s"
+                    _kill_process_group(proc.pid)
+                    proc.wait()
+            finally:
                 _kill_process_group(proc.pid)
                 proc.wait()
-        finally:
-            _kill_process_group(proc.pid)
-            proc.wait()
-            if proc.stdout is not None:
-                proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+        junit_verified = _verify_junit_xml(junit_path, case.protected_test_files)
 
     post_test_intact = _check_test_hashes(workspace_root, resolved_test_hashes)
     test_files_intact = pre_test_intact and post_test_intact
 
+    post_only_allowed, modified_files = _inspect_workspace_files(case, workspace_root)
+    only_allowed = pre_only_allowed and post_only_allowed
+
     tests_passed = (
         not timed_out
         and exit_code == 0
-        and "passed" in test_output
+        and junit_verified
     )
 
     repair_succeeded = bool(
