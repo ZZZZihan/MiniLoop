@@ -1,0 +1,21 @@
+{
+  "case_id": "case_03_date_window",
+  "split": "test",
+  "title": "Closed interval [start_ts, end_ts] boundary inclusion and range validation",
+  "task_prompt": "Fix the bug in `src/window_counter.py` so that all tests in `tests/test_window_counter.py` pass. You may only modify `src/window_counter.py`.",
+  "editable_files": [
+    "src/window_counter.py"
+  ],
+  "protected_test_files": [
+    "tests/test_window_counter.py"
+  ],
+  "test_command": [
+    "pytest",
+    "-q"
+  ],
+  "reference_fix": {
+    "path": "src/window_counter.py",
+    "old_str": "    return sum(1 for ts in timestamps if start_ts < ts < end_ts)",
+    "new_str": "    if start_ts > end_ts:\n        raise ValueError(\"start_ts must be <= end_ts\")\n    return sum(1 for ts in timestamps if start_ts <= ts <= end_ts)"
+  }
+}

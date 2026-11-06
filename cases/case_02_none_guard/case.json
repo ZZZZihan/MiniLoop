@@ -1,0 +1,21 @@
+{
+  "case_id": "case_02_none_guard",
+  "split": "dev",
+  "title": "Preserve explicit falsy overrides (0, False, empty string) when merging configuration",
+  "task_prompt": "Fix the bug in `src/config_merge.py` so that all tests in `tests/test_config_merge.py` pass. You may only modify `src/config_merge.py`.",
+  "editable_files": [
+    "src/config_merge.py"
+  ],
+  "protected_test_files": [
+    "tests/test_config_merge.py"
+  ],
+  "test_command": [
+    "pytest",
+    "-q"
+  ],
+  "reference_fix": {
+    "path": "src/config_merge.py",
+    "old_str": "        merged[k] = overrides.get(k) or v",
+    "new_str": "        val = overrides.get(k)\n        merged[k] = val if val is not None else v"
+  }
+}

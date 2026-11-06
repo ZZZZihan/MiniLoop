@@ -1,0 +1,21 @@
+{
+  "case_id": "case_05_retry_backoff",
+  "split": "test",
+  "title": "1-based exponential retry backoff exponent and max_delay ceiling",
+  "task_prompt": "Fix the bug in `src/backoff.py` so that all tests in `tests/test_backoff.py` pass. You may only modify `src/backoff.py`.",
+  "editable_files": [
+    "src/backoff.py"
+  ],
+  "protected_test_files": [
+    "tests/test_backoff.py"
+  ],
+  "test_command": [
+    "pytest",
+    "-q"
+  ],
+  "reference_fix": {
+    "path": "src/backoff.py",
+    "old_str": "    delay = base_delay * (2 ** attempt)\n    return float(delay)",
+    "new_str": "    delay = base_delay * (2 ** (attempt - 1))\n    return float(min(delay, max_delay))"
+  }
+}
