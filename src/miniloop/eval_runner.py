@@ -323,6 +323,7 @@ def _extract_expected_test_nodeids(case: RepairCase) -> set[str]:
 
 _TRUSTED_PYTEST_RUNNER_CODE = """\
 import ast
+import builtins
 import errno
 import gc
 import json
@@ -330,6 +331,8 @@ import os
 import posix
 import sys
 import types
+import _pytest.python
+import _pytest.runner
 import pytest
 from _pytest.assertion.rewrite import rewrite_asserts
 
@@ -356,12 +359,26 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
     pristine_tests = dict(bootstrap["pristine_tests"])
     del bootstrap
 
+    orig_fn_cls = _pytest.python.Function
+    orig_fn_runtest = _pytest.python.Function.runtest
+    orig_pyfunc_call = _pytest.python.pytest_pyfunc_call
+    orig_runtestprotocol = _pytest.runner.runtestprotocol
+    orig_call_and_report = _pytest.runner.call_and_report
+    orig_pytest_raises = pytest.raises
+    orig_assertion_error = builtins.AssertionError
+
     def _code_fingerprint(code_obj: types.CodeType) -> tuple[object, ...]:
         consts_fp = tuple(
             _code_fingerprint(c) if isinstance(c, types.CodeType) else c
             for c in code_obj.co_consts
         )
-        return (code_obj.co_code, consts_fp, code_obj.co_names, code_obj.co_varnames)
+        return (
+            code_obj.co_code,
+             code_obj.co_consts,
+            consts_fp,
+            code_obj.co_names,
+            code_obj.co_varnames,
+        )
 
     pristine_code_map: dict[str, set[tuple[object, ...]]] = {}
     for rel_path, src_text in pristine_tests.items():
@@ -387,6 +404,43 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
                             nid = f"{norm_rel}::{c.co_name}::{m.co_name}"
                             pristine_code_map.setdefault(nid, set()).add(_code_fingerprint(m))
     del pristine_tests
+
+    start_counts: dict[types.CodeType, int] = {}
+    return_counts: dict[types.CodeType, int] = {}
+    unwind_counts: dict[types.CodeType, int] = {}
+
+    def _on_py_start(code: types.CodeType, _offset: int) -> object:
+        start_counts[code] = start_counts.get(code, 0) + 1
+        return None
+
+    def _on_py_return(code: types.CodeType, _offset: int, _retval: object) -> object:
+        return_counts[code] = return_counts.get(code, 0) + 1
+        return None
+
+    def _on_py_unwind(code: types.CodeType, _offset: int, _exc: BaseException) -> object:
+        unwind_counts[code] = unwind_counts.get(code, 0) + 1
+        return None
+
+    mon = sys.monitoring
+    TOOL_ID = mon.OPTIMIZER_ID
+    mon.use_tool_id(TOOL_ID, "miniloop_eval_vm")
+    mon.register_callback(TOOL_ID, mon.events.PY_START, _on_py_start)
+    mon.register_callback(TOOL_ID, mon.events.PY_RETURN, _on_py_return)
+    mon.register_callback(TOOL_ID, mon.events.PY_UNWIND, _on_py_unwind)
+    mon.set_events(
+        TOOL_ID,
+        mon.events.PY_START | mon.events.PY_RETURN | mon.events.PY_UNWIND,
+    )
+
+    def _blocked_monitoring(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("sys.monitoring is locked in trusted test runner")
+
+    mon.register_callback = _blocked_monitoring
+    mon.set_events = _blocked_monitoring
+    mon.set_local_events = _blocked_monitoring
+    mon.free_tool_id = _blocked_monitoring
+    mon.use_tool_id = _blocked_monitoring
+    mon.restart_events = _blocked_monitoring
 
     os_write = os.write
     os_close = os.close
@@ -447,9 +501,9 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
 
         @pytest.hookimpl(hookwrapper=True)
         def pytest_runtest_call(self, item: object):
-            sys.audit("miniloop.verify_item", item)
+            sys.audit("miniloop.call_enter", item)
             yield
-            sys.audit("miniloop.verify_item", item)
+            sys.audit("miniloop.call_exit", item)
 
         def pytest_runtest_teardown(self, item: object) -> None:
             sys.audit("miniloop.verify_item", item)
@@ -458,6 +512,9 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
             sys.audit("miniloop.logreport", report)
 
     collect_code = _TrustedPlugin.pytest_collectreport.__code__
+    setup_code = _TrustedPlugin.pytest_runtest_setup.__code__
+    call_code = _TrustedPlugin.pytest_runtest_call.__code__
+    teardown_code = _TrustedPlugin.pytest_runtest_teardown.__code__
     logreport_code = _TrustedPlugin.pytest_runtest_logreport.__code__
     runner_co_filename = runner_code.co_filename
 
@@ -466,6 +523,8 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
     finalized = False
     node_phases: dict[str, dict[str, str]] = {}
     verified_counts: dict[str, int] = {}
+    active_call_snapshots: dict[str, tuple[types.CodeType, int, int, int]] = {}
+    vm_verified_nodeids: set[str] = set()
     failures = 0
     errors = 0
     skipped = 0
@@ -479,6 +538,7 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
             "os.posix_spawn",
             "os.fork",
             "os.forkpty",
+            "sys.monitoring.register_callback",
         }
     )
 
@@ -493,22 +553,45 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
             f = f.f_back
         return False
 
-    def _verify_item_code(item: object) -> None:
+    def _verify_pytest_refs() -> bool:
+        return (
+            _pytest.python.Function is orig_fn_cls
+            and _pytest.python.Function.runtest is orig_fn_runtest
+            and _pytest.python.pytest_pyfunc_call is orig_pyfunc_call
+            and _pytest.runner.runtestprotocol is orig_runtestprotocol
+            and _pytest.runner.call_and_report is orig_call_and_report
+            and pytest.raises is orig_pytest_raises
+            and builtins.AssertionError is orig_assertion_error
+        )
+
+    def _verify_item_code(item: object) -> tuple[str, types.CodeType]:
         nonlocal tampered
-        nodeid = str(getattr(item, "nodeid", "")).replace("\\\\", "/")
-        base_nodeid = nodeid.split("[", 1)[0]
+        if not _verify_pytest_refs():
+            tampered = True
+            raise RuntimeError("Tampered pytest runner or assertion references detected")
+        if (
+            not isinstance(item, orig_fn_cls)
+            or getattr(type(item), "runtest", None) is not orig_fn_runtest
+            or "runtest" in getattr(item, "__dict__", {})
+        ):
+            tampered = True
+            raise RuntimeError("Tampered pytest Function item detected")
+
+        norm_nodeid = str(getattr(item, "nodeid", "")).replace("\\\\", "/")
+        base_nodeid = norm_nodeid.split("[", 1)[0]
         allowed_fps = pristine_code_map.get(base_nodeid)
         if not allowed_fps:
             tampered = True
-            raise RuntimeError(f"Unexpected test nodeid: {nodeid}")
+            raise RuntimeError(f"Unexpected test nodeid: {norm_nodeid}")
 
         fn = getattr(item, "obj", None)
-        if (
-            not isinstance(fn, types.FunctionType)
-            or _code_fingerprint(fn.__code__) not in allowed_fps
-        ):
+        if not isinstance(fn, types.FunctionType):
             tampered = True
-            raise RuntimeError(f"Tampered test function bytecode detected for {nodeid}")
+            raise RuntimeError(f"Tampered test function object for {norm_nodeid}")
+        code = fn.__code__
+        if not isinstance(code, types.CodeType) or _code_fingerprint(code) not in allowed_fps:
+            tampered = True
+            raise RuntimeError(f"Tampered test function bytecode detected for {norm_nodeid}")
 
         mod = getattr(item, "module", None)
         orig_name = str(getattr(item, "originalname", None) or getattr(item, "name", ""))
@@ -521,8 +604,9 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
                 or _code_fingerprint(attr_fn.__code__) not in allowed_fps
             ):
                 tampered = True
-                raise RuntimeError(f"Tampered module test attribute detected for {nodeid}")
-        verified_counts[nodeid] = verified_counts.get(nodeid, 0) + 1
+                raise RuntimeError(f"Tampered module test attribute detected for {norm_nodeid}")
+        verified_counts[norm_nodeid] = verified_counts.get(norm_nodeid, 0) + 1
+        return norm_nodeid, code
 
     def _audit_hook(event: str, args: tuple[object, ...]) -> None:
         nonlocal in_user_phase, internal_check, finalized, failures, errors, skipped, tampered
@@ -533,10 +617,57 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
             internal_check = True
             try:
                 caller = sys_getframe(1)
-                if _has_workspace_frame_on_stack(caller):
+                if (
+                    (caller.f_code is not setup_code and caller.f_code is not teardown_code)
+                    or _has_workspace_frame_on_stack(caller)
+                ):
                     tampered = True
                     raise RuntimeError("Unauthorized verify_item call from workspace")
                 _verify_item_code(args[0])
+            finally:
+                internal_check = False
+            return
+
+        if event == "miniloop.call_enter":
+            internal_check = True
+            try:
+                caller = sys_getframe(1)
+                if caller.f_code is not call_code or _has_workspace_frame_on_stack(caller):
+                    tampered = True
+                    raise RuntimeError("Unauthorized call_enter call from workspace")
+                norm_nodeid, code = _verify_item_code(args[0])
+                s0 = start_counts.get(code, 0)
+                r0 = return_counts.get(code, 0)
+                u0 = unwind_counts.get(code, 0)
+                active_call_snapshots[norm_nodeid] = (code, s0, r0, u0)
+            finally:
+                internal_check = False
+            return
+
+        if event == "miniloop.call_exit":
+            internal_check = True
+            try:
+                caller = sys_getframe(1)
+                if caller.f_code is not call_code or _has_workspace_frame_on_stack(caller):
+                    tampered = True
+                    raise RuntimeError("Unauthorized call_exit call from workspace")
+                norm_nodeid, code = _verify_item_code(args[0])
+                snap = active_call_snapshots.pop(norm_nodeid, None)
+                if snap is None:
+                    tampered = True
+                    vm_verified_nodeids.discard(norm_nodeid)
+                    return
+                expected_code, s0, r0, u0 = snap
+                if (
+                    code is expected_code
+                    and start_counts.get(code, 0) > s0
+                    and return_counts.get(code, 0) > r0
+                    and unwind_counts.get(code, 0) == u0
+                ):
+                    vm_verified_nodeids.add(norm_nodeid)
+                else:
+                    tampered = True
+                    vm_verified_nodeids.discard(norm_nodeid)
             finally:
                 internal_check = False
             return
@@ -592,7 +723,8 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
                 finalized = True
                 in_user_phase = False
                 exit_code, had_exception = int(args[0]), bool(args[1])
-                if had_exception:
+                if had_exception or not _verify_pytest_refs():
+                    tampered = True
                     errors += 1
                 if tampered:
                     passed_nodeids: list[str] = []
@@ -604,6 +736,7 @@ def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
                         if phases.get("setup") == "passed"
                         and phases.get("call") == "passed"
                         and phases.get("teardown") == "passed"
+                        and nid in vm_verified_nodeids
                         and verified_counts.get(nid, 0) >= 4
                     )
                 report_bytes = json.dumps(

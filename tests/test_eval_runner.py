@@ -381,3 +381,26 @@ def test_runtime_unauthorized_file_created_during_post_eval_test_is_rejected(
     assert verdict.repair_succeeded is False
     assert verdict.failure_reason == "disallowed_file_modified"
 
+
+def test_import_time_pytest_function_runtest_monkeypatch_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verify monkeypatching _pytest.python.Function.runtest at import time is rejected."""
+    case = load_cases(split="dev")[0]
+    ws_dir = tmp_path / "runtest_monkeypatch_ws"
+    expected_hashes = prepare_isolated_workspace(case, ws_dir)
+
+    src_file = ws_dir / case.reference_fix.path
+    original_unfixed_src = src_file.read_text(encoding="utf-8")
+    src_file.write_text(
+        "import _pytest.python; _pytest.python.Function.runtest = lambda self: None\n"
+        + original_unfixed_src,
+        encoding="utf-8",
+    )
+
+    verdict = evaluate_repaired_workspace(case, ws_dir, expected_hashes)
+    assert verdict.tests_passed is False
+    assert verdict.repair_succeeded is False
+    assert verdict.failure_reason == "tests_failed"
+
+
