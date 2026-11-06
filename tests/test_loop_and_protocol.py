@@ -205,6 +205,151 @@ def test_run_loop_clock_expiry_before_and_during_model_call(tmp_path: Path) -> N
     assert rep.exit_reason == ExitReason.TIME_LIMIT
 
 
+def test_run_loop_retry_recomputes_deadline_and_post_response_time_limit(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    registry = ToolRegistry([build_read_file_tool(ws)])
+
+    # Case 1: Attempt 1 fails and exhausts max_wall_time_sec -> no retry attempt 2, exits TIME_LIMIT
+    clock_1 = _StepClock()
+    traj_no_retry = tmp_path / "no_retry_after_deadline.jsonl"
+
+    def _fail_past_deadline(
+        _msgs: Sequence[Message],
+        _tools: Sequence[dict[str, Any]],
+    ) -> ModelTurnResponse:
+        clock_1.advance(10.5)
+        raise ModelAdapterError("HTTP 503 Service Unavailable", status_code=503)
+
+    adapter_1 = FakeModelAdapter(
+        steps=[
+            _fail_past_deadline,
+            make_text_turn("Must never be called"),
+        ]
+    )
+    res_1 = run_loop(
+        "Do not retry past deadline",
+        adapter=adapter_1,
+        registry=registry,
+        budget_config=BudgetConfig(
+            max_wall_time_sec=10.0,
+            per_request_timeout_sec=8.0,
+            max_model_retries=2,
+        ),
+        trajectory_path=traj_no_retry,
+        clock=clock_1,
+    )
+    assert res_1.exit_reason == ExitReason.TIME_LIMIT
+    assert res_1.model_calls == 1
+    assert adapter_1.call_count == 1
+    rep_1 = replay_trajectory(traj_no_retry)
+    assert rep_1.exit_reason == ExitReason.TIME_LIMIT
+
+    # Case 2: Attempt 1 takes 6s of 10s budget -> Attempt 2 gets recalculated timeout=4s;
+    # Attempt 2 returns final text at t=10.5s -> exits TIME_LIMIT instead of COMPLETED
+    clock_2 = _StepClock()
+    traj_post_resp = tmp_path / "post_response_deadline.jsonl"
+    observed_timeouts: list[float] = []
+    observed_max_retries: list[int] = []
+
+    class _DeadlineTrackingAdapter:
+        def __init__(self) -> None:
+            self.provider = "custom"
+            self.model_name = "deadline-tracker"
+
+        def close(self) -> None:
+            pass
+
+        def generate(
+            self,
+            messages: Sequence[Message],
+            tools: Sequence[dict[str, Any]],
+            *,
+            timeout_sec: float,
+            max_retries: int = 0,
+        ) -> ModelTurnResponse:
+            observed_timeouts.append(timeout_sec)
+            observed_max_retries.append(max_retries)
+            if len(observed_timeouts) == 1:
+                clock_2.advance(6.0)
+                raise ModelAdapterError("HTTP 503 Service Unavailable", status_code=503)
+            clock_2.advance(4.5)
+            return make_text_turn("Late final answer after deadline")
+
+    res_2 = run_loop(
+        "Recalculate retry timeout and check post-response deadline",
+        adapter=_DeadlineTrackingAdapter(),
+        registry=registry,
+        budget_config=BudgetConfig(
+            max_wall_time_sec=10.0,
+            per_request_timeout_sec=8.0,
+            max_model_retries=2,
+        ),
+        trajectory_path=traj_post_resp,
+        clock=clock_2,
+    )
+    assert observed_timeouts == [pytest.approx(8.0), pytest.approx(4.0)]
+    assert observed_max_retries == [0, 0]
+    assert res_2.exit_reason == ExitReason.TIME_LIMIT
+    assert res_2.final_answer is None
+    assert res_2.model_calls == 2
+    rep_2 = replay_trajectory(traj_post_resp)
+    assert rep_2.exit_reason == ExitReason.TIME_LIMIT
+    assert rep_2.final_answer is None
+
+
+def test_run_loop_rejects_cross_turn_duplicate_call_id(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("alpha", encoding="utf-8")
+    (ws / "b.txt").write_text("beta", encoding="utf-8")
+    traj_path = tmp_path / "cross_turn_dup.jsonl"
+
+    base_tool = build_read_file_tool(ws)
+    executed_paths: list[str] = []
+
+    def _counting_handler(args: dict[str, Any], timeout_sec: float) -> str:
+        executed_paths.append(str(args["path"]))
+        return base_tool.handler(args, timeout_sec)
+
+    from miniloop.tools.registry import ToolDefinition
+
+    counted_tool = ToolDefinition(
+        name=base_tool.name,
+        description=base_tool.description,
+        parameters_schema=base_tool.parameters_schema,
+        handler=_counting_handler,
+    )
+    registry = ToolRegistry([counted_tool])
+
+    adapter = FakeModelAdapter(
+        steps=[
+            make_tool_call_turn([("call_1", "read_file", {"path": "a.txt"})]),
+            make_tool_call_turn([("call_1", "read_file", {"path": "b.txt"})]),
+            make_text_turn("Should not be reached"),
+        ]
+    )
+    res = run_loop(
+        "Test cross-turn duplicate call_id",
+        adapter=adapter,
+        registry=registry,
+        trajectory_path=traj_path,
+        run_id="run_cross_turn_dup",
+    )
+    assert res.exit_reason == ExitReason.PROTOCOL_ERROR
+    assert res.model_calls == 2
+    assert res.tool_calls == 1
+    assert executed_paths == ["a.txt"]
+
+    rep = replay_trajectory(traj_path)
+    assert rep.exit_reason == ExitReason.PROTOCOL_ERROR
+    assert len(rep.exchanges) == 1
+    assert rep.exchanges[0].call_id == "call_1"
+    assert rep.exchanges[0].result_content == "alpha"
+
+
 def test_cli_verify_protocol_run_and_replay(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

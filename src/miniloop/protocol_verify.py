@@ -552,7 +552,30 @@ def _scenario_s08_missing_or_duplicate_call_id_protocol_error(tmp_root: Path) ->
     assert get_exec_count() == 0
     rep_dup = replay_trajectory(traj_dup)
     assert rep_dup.exit_reason == ExitReason.PROTOCOL_ERROR
-    return "missing and duplicate call_id halted with protocol_error and 0 tool executions"
+
+    # Case C: Duplicate call_id reused across turns
+    traj_cross_dup = tmp_root / "s08_cross_dup.jsonl"
+    adapter_cross_dup = FakeModelAdapter(
+        steps=[
+            make_tool_call_turn([("call_reused", "read_file", {"path": "README_DEMO.md"})]),
+            make_tool_call_turn([("call_reused", "read_file", {"path": "config_sample.ini"})]),
+        ]
+    )
+    res_cross_dup = run_loop(
+        "Trigger cross-turn duplicate call_id",
+        adapter=adapter_cross_dup,
+        registry=registry,
+        trajectory_path=traj_cross_dup,
+        run_id="run_s08_cross_dup",
+    )
+    assert res_cross_dup.exit_reason == ExitReason.PROTOCOL_ERROR
+    assert res_cross_dup.model_calls == 2
+    assert res_cross_dup.tool_calls == 1
+    assert get_exec_count() == 1
+    rep_cross_dup = replay_trajectory(traj_cross_dup)
+    assert rep_cross_dup.exit_reason == ExitReason.PROTOCOL_ERROR
+    assert len(rep_cross_dup.exchanges) == 1
+    return "missing and same/cross-turn duplicate call_id halted with protocol_error"
 
 
 def _scenario_s09_multi_tool_calls_ordered_pairing(tmp_root: Path) -> str:

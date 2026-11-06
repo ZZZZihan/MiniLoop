@@ -14,27 +14,43 @@ from miniloop.secrets import SecretValue
 from miniloop.tools.registry import ToolRegistry
 from miniloop.trajectory import TrajectoryRecorder
 from miniloop.types import (
-    BudgetConfig,
+     BudgetConfig,
     ExitReason,
     Message,
+    ModelTurnResponse,
     RunResult,
     ToolCall,
 )
 
 
-def _validate_turn_tool_calls(tool_calls: Sequence[ToolCall]) -> None:
-    """Double-check that every tool call in a turn has a non-empty unique ID and valid structure."""
-    seen_ids: set[str] = set()
+def _is_retryable_model_error(exc: ModelAdapterError) -> bool:
+    """Return True if the model error is transient and eligible for retry."""
+    if exc.status_code is None:
+        return True
+    return exc.status_code == 429 or exc.status_code >= 500
+
+
+def _validate_turn_tool_calls(
+    tool_calls: Sequence[ToolCall],
+    run_seen_call_ids: set[str],
+) -> None:
+    """Double-check that every tool call has a valid structure and a run-wide unique ID."""
+    turn_seen_ids: set[str] = set()
     for tc in tool_calls:
         if not isinstance(tc.id, str) or not tc.id.strip():
             raise ProtocolViolationError("tool_call missing non-empty string 'id'")
-        if tc.id in seen_ids:
+        if tc.id in turn_seen_ids:
             raise ProtocolViolationError(f"Duplicate tool_call id in single turn: {tc.id!r}")
-        seen_ids.add(tc.id)
+        if tc.id in run_seen_call_ids:
+            raise ProtocolViolationError(
+                f"Duplicate tool_call id across turns in run: {tc.id!r}"
+            )
+        turn_seen_ids.add(tc.id)
         if not isinstance(tc.name, str) or not tc.name.strip():
             raise ProtocolViolationError("tool_call missing non-empty string 'name'")
         if not isinstance(tc.arguments, dict):
             raise ProtocolViolationError("tool_call 'arguments' must be a dict")
+    run_seen_call_ids.update(turn_seen_ids)
 
 
 def _collect_redaction_secrets(
@@ -102,6 +118,7 @@ def run_loop(
     )
 
     openai_tools = registry.to_openai_tools()
+    run_seen_call_ids: set[str] = set()
     turn_idx = 0
 
     while True:
@@ -181,6 +198,7 @@ def run_loop(
             )
 
         allowed_retries = tracker.remaining_retries_allowed()
+        max_attempts = 1 + allowed_retries
         _record(
             "model_request",
             {
@@ -191,66 +209,168 @@ def run_loop(
             },
         )
 
-        try:
-            turn_resp = adapter.generate(
-                messages,
-                openai_tools,
-                timeout_sec=req_timeout,
-                max_retries=allowed_retries,
-            )
-        except ModelAdapterError as exc:
-            tracker.record_model_calls(max(1, exc.attempts))
-            exit_reason = (
-                ExitReason.TIME_LIMIT
-                if tracker.remaining_sec <= 0
-                else ExitReason.MODEL_ERROR
-            )
-            _record(
-                "run_end",
-                {
-                    "exit_reason": exit_reason.value,
-                    "final_answer": None,
-                    "model_calls": tracker.model_calls,
-                    "tool_calls": tracker.tool_calls,
-                    "wall_time_sec": tracker.elapsed_sec,
-                    "error": str(exc),
-                },
-            )
-            return RunResult(
-                run_id=resolved_run_id,
-                exit_reason=exit_reason,
-                final_answer=None,
-                model_calls=tracker.model_calls,
-                tool_calls=tracker.tool_calls,
-                wall_time_sec=tracker.elapsed_sec,
-                trajectory_path=trajectory_path,
-                error_detail=str(exc),
-            )
-        except ProtocolViolationError as exc:
-            tracker.record_model_calls(max(1, exc.attempts))
-            _record(
-                "run_end",
-                {
-                    "exit_reason": ExitReason.PROTOCOL_ERROR.value,
-                    "final_answer": None,
-                    "model_calls": tracker.model_calls,
-                    "tool_calls": tracker.tool_calls,
-                    "wall_time_sec": tracker.elapsed_sec,
-                    "error": str(exc),
-                },
-            )
-            return RunResult(
-                run_id=resolved_run_id,
-                exit_reason=ExitReason.PROTOCOL_ERROR,
-                final_answer=None,
-                model_calls=tracker.model_calls,
-                tool_calls=tracker.tool_calls,
-                wall_time_sec=tracker.elapsed_sec,
-                trajectory_path=trajectory_path,
-                error_detail=str(exc),
-            )
+        turn_resp: ModelTurnResponse | None = None
+        attempt = 0
+        for attempt in range(1, max_attempts + 1):
+            if tracker.remaining_sec <= 0:
+                detail = "Wall time budget exhausted before model retry"
+                _record(
+                    "budget_stop",
+                    {
+                        "stage": "before_model_call",
+                        "exit_reason": ExitReason.TIME_LIMIT.value,
+                        "model_calls": tracker.model_calls,
+                        "tool_calls": tracker.tool_calls,
+                        "elapsed_sec": tracker.elapsed_sec,
+                    },
+                )
+                _record(
+                    "run_end",
+                    {
+                        "exit_reason": ExitReason.TIME_LIMIT.value,
+                        "final_answer": None,
+                        "model_calls": tracker.model_calls,
+                        "tool_calls": tracker.tool_calls,
+                        "wall_time_sec": tracker.elapsed_sec,
+                        "error": detail,
+                    },
+                )
+                return RunResult(
+                    run_id=resolved_run_id,
+                    exit_reason=ExitReason.TIME_LIMIT,
+                    final_answer=None,
+                    model_calls=tracker.model_calls,
+                    tool_calls=tracker.tool_calls,
+                    wall_time_sec=tracker.elapsed_sec,
+                    trajectory_path=trajectory_path,
+                    error_detail=detail,
+                )
 
-        tracker.record_model_calls(max(1, turn_resp.attempts))
+            try:
+                attempt_timeout = tracker.next_model_timeout()
+            except TimeoutError as exc:
+                detail = str(exc)
+                _record(
+                    "budget_stop",
+                    {
+                        "stage": "before_model_call",
+                        "exit_reason": ExitReason.TIME_LIMIT.value,
+                        "model_calls": tracker.model_calls,
+                        "tool_calls": tracker.tool_calls,
+                        "elapsed_sec": tracker.elapsed_sec,
+                    },
+                )
+                _record(
+                    "run_end",
+                    {
+                        "exit_reason": ExitReason.TIME_LIMIT.value,
+                        "final_answer": None,
+                        "model_calls": tracker.model_calls,
+                        "tool_calls": tracker.tool_calls,
+                        "wall_time_sec": tracker.elapsed_sec,
+                        "error": detail,
+                    },
+                )
+                return RunResult(
+                    run_id=resolved_run_id,
+                    exit_reason=ExitReason.TIME_LIMIT,
+                    final_answer=None,
+                    model_calls=tracker.model_calls,
+                    tool_calls=tracker.tool_calls,
+                    wall_time_sec=tracker.elapsed_sec,
+                    trajectory_path=trajectory_path,
+                    error_detail=detail,
+                )
+
+            tracker.record_model_calls(1)
+            try:
+                turn_resp = adapter.generate(
+                    messages,
+                    openai_tools,
+                    timeout_sec=attempt_timeout,
+                    max_retries=0,
+                )
+                break
+            except ModelAdapterError as exc:
+                if tracker.remaining_sec <= 0:
+                    _record(
+                        "budget_stop",
+                        {
+                            "stage": "after_model_call",
+                            "exit_reason": ExitReason.TIME_LIMIT.value,
+                            "model_calls": tracker.model_calls,
+                            "tool_calls": tracker.tool_calls,
+                            "elapsed_sec": tracker.elapsed_sec,
+                        },
+                    )
+                    _record(
+                        "run_end",
+                        {
+                            "exit_reason": ExitReason.TIME_LIMIT.value,
+                            "final_answer": None,
+                            "model_calls": tracker.model_calls,
+                            "tool_calls": tracker.tool_calls,
+                            "wall_time_sec": tracker.elapsed_sec,
+                            "error": str(exc),
+                        },
+                    )
+                    return RunResult(
+                        run_id=resolved_run_id,
+                        exit_reason=ExitReason.TIME_LIMIT,
+                        final_answer=None,
+                        model_calls=tracker.model_calls,
+                        tool_calls=tracker.tool_calls,
+                        wall_time_sec=tracker.elapsed_sec,
+                        trajectory_path=trajectory_path,
+                        error_detail=str(exc),
+                    )
+                if not _is_retryable_model_error(exc) or attempt >= max_attempts:
+                    _record(
+                        "run_end",
+                        {
+                            "exit_reason": ExitReason.MODEL_ERROR.value,
+                            "final_answer": None,
+                            "model_calls": tracker.model_calls,
+                            "tool_calls": tracker.tool_calls,
+                            "wall_time_sec": tracker.elapsed_sec,
+                            "error": str(exc),
+                        },
+                    )
+                    return RunResult(
+                        run_id=resolved_run_id,
+                        exit_reason=ExitReason.MODEL_ERROR,
+                        final_answer=None,
+                        model_calls=tracker.model_calls,
+                        tool_calls=tracker.tool_calls,
+                        wall_time_sec=tracker.elapsed_sec,
+                        trajectory_path=trajectory_path,
+                        error_detail=str(exc),
+                    )
+                continue
+            except ProtocolViolationError as exc:
+                _record(
+                    "run_end",
+                    {
+                        "exit_reason": ExitReason.PROTOCOL_ERROR.value,
+                        "final_answer": None,
+                        "model_calls": tracker.model_calls,
+                        "tool_calls": tracker.tool_calls,
+                        "wall_time_sec": tracker.elapsed_sec,
+                        "error": str(exc),
+                    },
+                )
+                return RunResult(
+                    run_id=resolved_run_id,
+                    exit_reason=ExitReason.PROTOCOL_ERROR,
+                    final_answer=None,
+                    model_calls=tracker.model_calls,
+                    tool_calls=tracker.tool_calls,
+                    wall_time_sec=tracker.elapsed_sec,
+                    trajectory_path=trajectory_path,
+                    error_detail=str(exc),
+                )
+
+        assert turn_resp is not None
         _record(
             "model_response",
             {
@@ -259,9 +379,43 @@ def run_loop(
                 "tool_calls": [asdict(tc) for tc in turn_resp.tool_calls],
                 "usage": asdict(turn_resp.usage),
                 "duration_ms": turn_resp.duration_ms,
-                "attempts": turn_resp.attempts,
+                "attempts": max(attempt, turn_resp.attempts),
             },
         )
+
+        if tracker.remaining_sec <= 0:
+            detail = "Wall time budget exhausted during model call"
+            _record(
+                "budget_stop",
+                {
+                    "stage": "after_model_call",
+                    "exit_reason": ExitReason.TIME_LIMIT.value,
+                    "model_calls": tracker.model_calls,
+                    "tool_calls": tracker.tool_calls,
+                    "elapsed_sec": tracker.elapsed_sec,
+                },
+            )
+            _record(
+                "run_end",
+                {
+                    "exit_reason": ExitReason.TIME_LIMIT.value,
+                    "final_answer": None,
+                    "model_calls": tracker.model_calls,
+                    "tool_calls": tracker.tool_calls,
+                    "wall_time_sec": tracker.elapsed_sec,
+                    "error": detail,
+                },
+            )
+            return RunResult(
+                run_id=resolved_run_id,
+                exit_reason=ExitReason.TIME_LIMIT,
+                final_answer=None,
+                model_calls=tracker.model_calls,
+                tool_calls=tracker.tool_calls,
+                wall_time_sec=tracker.elapsed_sec,
+                trajectory_path=trajectory_path,
+                error_detail=detail,
+            )
 
         # Step C: Termination check or serial tool execution
         if not turn_resp.tool_calls:
@@ -293,7 +447,7 @@ def run_loop(
             )
 
         try:
-            _validate_turn_tool_calls(turn_resp.tool_calls)
+            _validate_turn_tool_calls(turn_resp.tool_calls, run_seen_call_ids)
         except ProtocolViolationError as exc:
             _record(
                 "run_end",
