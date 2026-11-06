@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -319,3 +321,38 @@ def test_slow_tool_triggers_timeout_and_duplicate_registration_rejected() -> Non
     assert crash_res.is_error is True
     assert crash_res.error_code == "tool_runtime_error"
     assert "unexpected boom" in crash_res.content
+
+
+def test_timed_out_tool_does_not_block_process_exit() -> None:
+    script = (
+        "import time\n"
+        "from miniloop.tools import ToolDefinition, ToolRegistry\n"
+        "from miniloop.types import ToolCall\n"
+        "schema = {\n"
+        "    'type': 'object',\n"
+        "    'properties': {},\n"
+        "    'required': [],\n"
+        "    'additionalProperties': False,\n"
+        "}\n"
+        "tool = ToolDefinition(\n"
+        "    name='hang_tool',\n"
+        "    description='Sleeps 30s',\n"
+        "    parameters_schema=schema,\n"
+        "    handler=lambda _args, _timeout: (time.sleep(30), 'done')[1],\n"
+        ")\n"
+        "call = ToolCall(id='c1', name='hang_tool', arguments={})\n"
+        "res = ToolRegistry([tool]).execute(call, timeout_sec=0.05)\n"
+        "print(res.error_code)\n"
+    )
+    start = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=2.0,
+        check=True,
+    )
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0
+    assert proc.stdout.strip() == "tool_timeout"
+

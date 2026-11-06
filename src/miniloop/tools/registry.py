@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import concurrent.futures
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -153,11 +153,25 @@ class ToolRegistry:
                 duration_ms=(time.monotonic() - start) * 1000.0,
             )
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        result_box: list[str] = []
+        error_box: list[BaseException] = []
+
+        def _run_handler() -> None:
+            try:
+                result_box.append(tool.handler(dict(call.arguments), timeout_sec))
+            except BaseException as exc:
+                error_box.append(exc)
+
+        worker = threading.Thread(target=_run_handler, daemon=True)
         try:
-            future = executor.submit(tool.handler, dict(call.arguments), timeout_sec)
-            output = future.result(timeout=timeout_sec)
-        except (concurrent.futures.TimeoutError, TimeoutError):
+            worker.start()
+            worker.join(timeout=timeout_sec)
+            if worker.is_alive():
+                raise TimeoutError
+            if error_box:
+                raise error_box[0]
+            output = result_box[0]
+        except TimeoutError:
             return ToolResult(
                 call_id=call.id,
                 tool_name=call.name,
@@ -186,8 +200,6 @@ class ToolRegistry:
                 error_code="tool_runtime_error",
                 duration_ms=(time.monotonic() - start) * 1000.0,
             )
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
         return ToolResult(
             call_id=call.id,
