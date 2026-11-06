@@ -312,14 +312,9 @@ def prepare_isolated_workspace(case: RepairCase, dest_dir: Path) -> dict[str, st
     return protected_hashes
 
 
-def _run_case_tests(
-    workspace_dir: Path,
-    test_command: Sequence[str],
-    *,
-    timeout_sec: float = 15.0,
-) -> subprocess.CompletedProcess[str]:
-    """Run a case's test command inside workspace_dir with a clean environment."""
-    venv_bin = str(Path(sys.executable).resolve().parent)
+def _build_clean_test_env(workspace_dir: Path) -> dict[str, str]:
+    """Build a clean environment for running a case's test command."""
+    venv_bin = str(Path(sys.executable).parent)
     existing_path = os.environ.get("PATH", "")
     path_parts = [venv_bin, *([existing_path] if existing_path else [])]
 
@@ -332,6 +327,17 @@ def _run_case_tests(
     for preserved_key in ("HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "VIRTUAL_ENV"):
         if preserved_key in os.environ:
             clean_env[preserved_key] = os.environ[preserved_key]
+    return clean_env
+
+
+def _run_case_tests(
+    workspace_dir: Path,
+    test_command: Sequence[str],
+    *,
+    timeout_sec: float = 15.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run a case's test command inside workspace_dir with a clean environment."""
+    clean_env = _build_clean_test_env(workspace_dir)
 
     return subprocess.run(
         list(test_command),

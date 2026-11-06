@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
 
 from miniloop.cases import (
+    _build_clean_test_env,
     compute_cases_manifest,
     load_cases,
     prepare_isolated_workspace,
@@ -127,3 +130,29 @@ def test_every_case_passes_reference_fix_verification(
     cases_by_id = {c.case_id: c for c in load_cases(REPO_CASES_ROOT, split="all")}
     case = cases_by_id[case_id]
     assert verify_case_reference_fix(case, tmp_path) is True
+
+
+def test_build_clean_test_env_preserves_unresolved_venv_bin_in_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _build_clean_test_env(tmp_path)
+    assert env["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
+
+    # Also verify that if sys.executable is a symlink inside a virtualenv bin dir,
+    # its unresolved parent directory (not the symlink target's parent) is placed first.
+    real_bin = tmp_path / "usr_bin"
+    real_bin.mkdir()
+    real_python = real_bin / "python3"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    symlink_python = venv_bin / "python"
+    symlink_python.symlink_to(real_python)
+
+    monkeypatch.setattr(sys, "executable", str(symlink_python))
+    symlink_env = _build_clean_test_env(tmp_path)
+    assert symlink_env["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
+    assert symlink_env["PATH"].split(os.pathsep)[0] == str(venv_bin)
+
