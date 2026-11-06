@@ -91,6 +91,14 @@ def _normalize_secrets(
     return tuple(sorted(unique, key=len, reverse=True))
 
 
+def _sanitize_string(value: str, active_secrets: tuple[str, ...]) -> str:
+    redacted_str = _BEARER_PATTERN.sub(rf"\1{REDACTED}", value)
+    for secret in active_secrets:
+        if secret in redacted_str:
+            redacted_str = redacted_str.replace(secret, REDACTED)
+    return redacted_str
+
+
 def _sanitize_value(value: Any, active_secrets: tuple[str, ...]) -> Any:
     if isinstance(value, SecretValue):
         return REDACTED
@@ -98,17 +106,14 @@ def _sanitize_value(value: Any, active_secrets: tuple[str, ...]) -> Any:
         sanitized_dict: dict[str, Any] = {}
         for raw_key, raw_val in value.items():
             key_str = str(raw_key)
+            sanitized_key = _sanitize_string(key_str, active_secrets)
             if _is_sensitive_key(key_str):
-                sanitized_dict[key_str] = REDACTED
+                sanitized_dict[sanitized_key] = REDACTED
             else:
-                sanitized_dict[key_str] = _sanitize_value(raw_val, active_secrets)
+                sanitized_dict[sanitized_key] = _sanitize_value(raw_val, active_secrets)
         return sanitized_dict
     if isinstance(value, str):
-        redacted_str = _BEARER_PATTERN.sub(rf"\1{REDACTED}", value)
-        for secret in active_secrets:
-            if secret in redacted_str:
-                redacted_str = redacted_str.replace(secret, REDACTED)
-        return redacted_str
+        return _sanitize_string(value, active_secrets)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_sanitize_value(item, active_secrets) for item in value]
     return value
@@ -156,7 +161,7 @@ class TrajectoryRecorder:
             raise ValueError(
                 f"Invalid event_type {event_type!r}; expected one of {sorted(VALID_EVENT_TYPES)}"
             )
-        self._sequence += 1
+        next_sequence = self._sequence + 1
         sanitized_payload = sanitize_payload(dict(payload), secrets=self._secrets)
         if not isinstance(sanitized_payload, dict):
             raise TypeError("Sanitized payload must be a dict")
@@ -164,7 +169,7 @@ class TrajectoryRecorder:
         event = TrajectoryEvent(
             schema_version=TRAJECTORY_SCHEMA_VERSION,
             run_id=self.run_id,
-            sequence=self._sequence,
+            sequence=next_sequence,
             timestamp=datetime.now(UTC).isoformat(),
             event_type=event_type,
             payload=sanitized_payload,
@@ -183,6 +188,7 @@ class TrajectoryRecorder:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(serialized + "\n")
             handle.flush()
+        self._sequence = next_sequence
         return event
 
     def close(self) -> None:

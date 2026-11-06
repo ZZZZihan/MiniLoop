@@ -161,6 +161,55 @@ def test_sanitize_payload_redacts_keys_bearer_and_secrets() -> None:
     assert "tok_xyz_123" not in serialized
 
 
+def test_sanitize_payload_redacts_secrets_in_mapping_keys() -> None:
+    sentinel_secret = "sk-live-sentinel-123456"
+    raw = {
+        "tool_output": {
+            sentinel_secret: "present",
+            "Bearer key-in-dict-header": "ok",
+        }
+    }
+
+    cleaned = sanitize_payload(raw, secrets=[sentinel_secret])
+
+    assert cleaned == {
+        "tool_output": {
+            REDACTED: "present",
+            f"Bearer {REDACTED}": "ok",
+        }
+    }
+    assert sentinel_secret not in json.dumps(cleaned)
+
+
+def test_trajectory_recorder_does_not_advance_sequence_on_failed_write(
+    tmp_path: Path,
+) -> None:
+    traj_path = tmp_path / "runs" / "failed_event.jsonl"
+    recorder = TrajectoryRecorder(traj_path, run_id="run_seq_atomic")
+
+    recorder.record("run_start", {"task": "Check sequence atomicity"})
+    assert recorder.sequence == 1
+
+    with pytest.raises(TypeError):
+        recorder.record("model_request", {"unserializable": object()})
+    assert recorder.sequence == 1
+
+    recorder.record(
+        "run_end",
+        {
+            "exit_reason": "runtime_error",
+            "final_answer": None,
+            "model_calls": 0,
+            "tool_calls": 0,
+        },
+    )
+    assert recorder.sequence == 2
+
+    report = replay_trajectory(traj_path)
+    assert [event.sequence for event in report.events] == [1, 2]
+    assert report.exit_reason == ExitReason.RUNTIME_ERROR
+
+
 def test_trajectory_recorder_and_readonly_replay(tmp_path: Path) -> None:
     traj_path = tmp_path / "nested" / "runs" / "traj.jsonl"
     sentinel = "magpie-live-secret-token-4242"
