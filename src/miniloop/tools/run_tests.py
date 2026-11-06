@@ -102,11 +102,10 @@ def _build_clean_test_env(
         if key in _SAFE_ENV_KEYS:
             clean_env[key] = value
 
-    python_bin_dir = str(Path(sys.executable).resolve().parent)
+    python_bin_dir = str(Path(sys.executable).parent)
     existing_path = clean_env.get("PATH", "")
-    path_parts = [p for p in existing_path.split(os.pathsep) if p]
-    if python_bin_dir not in path_parts:
-        path_parts.insert(0, python_bin_dir)
+    path_parts = [p for p in existing_path.split(os.pathsep) if p and p != python_bin_dir]
+    path_parts.insert(0, python_bin_dir)
     clean_env["PATH"] = os.pathsep.join(path_parts)
 
     root = workspace_root.resolve()

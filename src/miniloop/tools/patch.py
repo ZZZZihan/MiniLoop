@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import os
+import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,6 +162,14 @@ class PatchStore:
             )
 
         new_content = content.replace(old_str, new_str, 1)
+        try:
+            new_content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ToolExecutionError(
+                "invalid_patch_content",
+                "Replacement content is not valid UTF-8",
+            ) from exc
+
         diff_lines = difflib.unified_diff(
             content.splitlines(keepends=True),
             new_content.splitlines(keepends=True),
@@ -213,7 +223,37 @@ class PatchStore:
                 f"Target file '{proposal.rel_path}' changed since patch '{patch_id}' was proposed",
             )
 
-        target = resolve_workspace_path(self.workspace_root, proposal.rel_path)
+        try:
+            target = resolve_workspace_path(self.workspace_root, proposal.rel_path)
+        except ToolExecutionError:
+            proposal.status = "invalidated"
+            raise
+
+        root_resolved = self.workspace_root.resolve()
+        raw_entry = root_resolved / proposal.rel_path
+        current_norm_rel = target.relative_to(root_resolved).as_posix()
+
+        if (
+            _is_protected_test_path(current_norm_rel)
+            or _is_protected_test_path(proposal.rel_path)
+            or (
+                self.editable_files is not None
+                and current_norm_rel not in self.editable_files
+            )
+        ):
+            proposal.status = "invalidated"
+            raise ToolExecutionError(
+                "patch_path_forbidden",
+                f"File '{current_norm_rel}' is protected and cannot be modified",
+            )
+
+        if current_norm_rel != proposal.rel_path or raw_entry.is_symlink():
+            proposal.status = "invalidated"
+            raise ToolExecutionError(
+                "patch_stale_file_changed",
+                f"Target file '{proposal.rel_path}' changed since patch '{patch_id}' was proposed",
+            )
+
         if not target.exists() or target.is_dir() or not target.is_file():
             proposal.status = "invalidated"
             raise ToolExecutionError(
@@ -230,12 +270,39 @@ class PatchStore:
             )
 
         try:
-            target.write_text(proposal.new_content, encoding="utf-8")
+            encoded_bytes = proposal.new_content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ToolExecutionError(
+                "invalid_patch_content",
+                "Replacement content is not valid UTF-8",
+            ) from exc
+
+        tmp_path: Path | None = None
+        replaced = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=target.parent,
+                prefix=".miniloop_patch_",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(encoded_bytes)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_path, target)
+            replaced = True
         except OSError as exc:
             raise ToolExecutionError(
                 "file_write_error",
                 f"Failed to write '{proposal.rel_path}': {exc}",
             ) from exc
+        finally:
+            if not replaced and tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         for other_id, other in self._proposals.items():
             if (

@@ -575,3 +575,125 @@ def test_end_to_end_repair_loop_with_patch_and_test_tools(tmp_path: Path) -> Non
     assert result.tool_calls == 5
     assert verify_file_hashes(ws, protected_hashes) is None
     assert "(page - 1) * page_size" in (ws / "src" / "paginator.py").read_text(encoding="utf-8")
+
+
+def test_apply_patch_blocks_post_propose_symlink_swap_to_protected_or_other_file(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "workspace_symlink"
+    (ws / "src").mkdir(parents=True)
+    (ws / "tests").mkdir(parents=True)
+
+    shared_content = "def compute() -> int:\n    return 1\n"
+    src_app = ws / "src" / "app.py"
+    src_other = ws / "src" / "other.py"
+    test_app = ws / "tests" / "test_app.py"
+
+    src_app.write_text(shared_content, encoding="utf-8")
+    src_other.write_text(shared_content, encoding="utf-8")
+    test_app.write_text(shared_content, encoding="utf-8")
+
+    test_sha_before = file_sha256(test_app)
+    other_sha_before = file_sha256(src_other)
+
+    store = PatchStore(ws, editable_files=frozenset({"src/app.py", "src/other.py"}))
+    propose_tool, apply_tool = build_patch_tools(store)
+    registry = ToolRegistry([propose_tool, apply_tool])
+
+    # 1. Propose patch on src/app.py, then swap src/app.py with a symlink to tests/test_app.py
+    prop_1 = registry.execute(
+        ToolCall(
+            id="c_prop_sym_test",
+            name="propose_patch",
+            arguments={
+                "path": "src/app.py",
+                "old_str": "return 1",
+                "new_str": "return 2",
+            },
+        )
+    )
+    assert prop_1.is_error is False
+    assert "patch_id: patch_0001" in prop_1.content
+
+    src_app.unlink()
+    src_app.symlink_to(test_app)
+
+    apply_1 = registry.execute(
+        ToolCall(
+            id="c_app_sym_test",
+            name="apply_patch",
+            arguments={"patch_id": "patch_0001"},
+        )
+    )
+    assert apply_1.is_error is True
+    assert apply_1.error_code in {"patch_path_forbidden", "patch_stale_file_changed"}
+    assert file_sha256(test_app) == test_sha_before
+    assert test_app.read_text(encoding="utf-8") == shared_content
+    p1 = store.get("patch_0001")
+    assert p1 is not None and p1.status == "invalidated"
+
+    # 2. Restore src/app.py, propose again, then swap src/app.py with a symlink to src/other.py
+    src_app.unlink()
+    src_app.write_text(shared_content, encoding="utf-8")
+
+    prop_2 = registry.execute(
+        ToolCall(
+            id="c_prop_sym_other",
+            name="propose_patch",
+            arguments={
+                "path": "src/app.py",
+                "old_str": "return 1",
+                "new_str": "return 99",
+            },
+        )
+    )
+    assert prop_2.is_error is False
+    assert "patch_id: patch_0002" in prop_2.content
+
+    src_app.unlink()
+    src_app.symlink_to(src_other)
+
+    apply_2 = registry.execute(
+        ToolCall(
+            id="c_app_sym_other",
+            name="apply_patch",
+            arguments={"patch_id": "patch_0002"},
+        )
+    )
+    assert apply_2.is_error is True
+    assert apply_2.error_code == "patch_stale_file_changed"
+    assert file_sha256(src_other) == other_sha_before
+    assert src_other.read_text(encoding="utf-8") == shared_content
+    p2 = store.get("patch_0002")
+    assert p2 is not None and p2.status == "invalidated"
+
+
+def test_patch_rejects_lone_surrogate_utf8_and_preserves_original_file(
+    tmp_path: Path,
+) -> None:
+    ws = _create_sample_workspace(tmp_path)
+    target = ws / "src" / "paginator.py"
+    original_content = target.read_text(encoding="utf-8")
+    original_sha = file_sha256(target)
+
+    store = PatchStore(ws, editable_files=frozenset({"src/paginator.py"}))
+    propose_tool, apply_tool = build_patch_tools(store)
+    registry = ToolRegistry([propose_tool, apply_tool])
+
+    bad_res = registry.execute(
+        ToolCall(
+            id="c_surrogate",
+            name="propose_patch",
+            arguments={
+                "path": "src/paginator.py",
+                "old_str": "    start = page * page_size\n",
+                "new_str": "    start = page * page_size  # \ud800\n",
+            },
+        )
+    )
+    assert bad_res.is_error is True
+    assert bad_res.error_code == "invalid_patch_content"
+    assert target.read_text(encoding="utf-8") == original_content
+    assert file_sha256(target) == original_sha
+    assert list(target.parent.glob(".miniloop_patch_*")) == []
+
