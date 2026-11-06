@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
 import hashlib
 import json
 import os
+import secrets
 import subprocess
-import tempfile
-import xml.etree.ElementTree as ET
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -294,60 +295,423 @@ def _inspect_workspace_files(
     return only_allowed, tuple(sorted(modified))
 
 
-def _verify_junit_xml(
-    junit_path: Path,
-    protected_test_files: Sequence[str],
+def _extract_expected_test_nodeids(case: RepairCase) -> set[str]:
+    """Extract authoritative expected pytest nodeids from read-only case test files via AST."""
+    expected: set[str] = set()
+    for rel_path in case.protected_test_files:
+        norm_rel = Path(rel_path).as_posix()
+        src_path = case.case_dir / norm_rel
+        try:
+            source_text = src_path.read_text(encoding="utf-8")
+            tree = ast.parse(source_text, filename=norm_rel)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            return set()
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+                "test_"
+            ):
+                expected.add(f"{norm_rel}::{node.name}")
+            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                for item in node.body:
+                    if isinstance(
+                        item, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ) and item.name.startswith("test_"):
+                        expected.add(f"{norm_rel}::{node.name}::{item.name}")
+    return expected
+
+
+_TRUSTED_PYTEST_RUNNER_CODE = """\
+import ast
+import errno
+import gc
+import json
+import os
+import posix
+import sys
+import types
+import pytest
+from _pytest.assertion.rewrite import rewrite_asserts
+
+
+def _bootstrap_sandbox(runner_code: types.CodeType) -> object:
+    raw_stdin = sys.stdin.read()
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull_fd, 0)
+    os.close(devnull_fd)
+    sys.stdin = open(os.devnull, "r", encoding="utf-8")
+    sys.__stdin__ = sys.stdin
+
+    bootstrap = json.loads(raw_stdin)
+    del raw_stdin
+
+    nonce = str(bootstrap["nonce"])
+    report_fd = int(bootstrap["report_fd"])
+    workspace_root = os.path.realpath(str(bootstrap["workspace_root"]))
+    workspace_prefix = workspace_root + os.sep
+    editable_abs_paths = frozenset(
+        os.path.realpath(os.path.join(workspace_root, rel))
+        for rel in bootstrap["editable_files"]
+    )
+    pristine_tests = dict(bootstrap["pristine_tests"])
+    del bootstrap
+
+    def _code_fingerprint(code_obj: types.CodeType) -> tuple[object, ...]:
+        consts_fp = tuple(
+            _code_fingerprint(c) if isinstance(c, types.CodeType) else c
+            for c in code_obj.co_consts
+        )
+        return (code_obj.co_code, consts_fp, code_obj.co_names, code_obj.co_varnames)
+
+    pristine_code_map: dict[str, set[tuple[object, ...]]] = {}
+    for rel_path, src_text in pristine_tests.items():
+        norm_rel = rel_path.replace("\\\\", "/")
+        abs_path = os.path.realpath(os.path.join(workspace_root, norm_rel))
+        plain_tree = ast.parse(src_text, filename=abs_path)
+        plain_mod_code = compile(plain_tree, abs_path, "exec", dont_inherit=True)
+
+        rewritten_tree = ast.parse(src_text, filename=abs_path)
+        rewrite_asserts(rewritten_tree, src_text.encode("utf-8"), abs_path)
+        rewritten_mod_code = compile(rewritten_tree, abs_path, "exec", dont_inherit=True)
+
+        for mod_code in (plain_mod_code, rewritten_mod_code):
+            for c in mod_code.co_consts:
+                if not isinstance(c, types.CodeType):
+                    continue
+                if c.co_name.startswith("test_"):
+                    nid = f"{norm_rel}::{c.co_name}"
+                    pristine_code_map.setdefault(nid, set()).add(_code_fingerprint(c))
+                elif c.co_name.startswith("Test"):
+                    for m in c.co_consts:
+                        if isinstance(m, types.CodeType) and m.co_name.startswith("test_"):
+                            nid = f"{norm_rel}::{c.co_name}::{m.co_name}"
+                            pristine_code_map.setdefault(nid, set()).add(_code_fingerprint(m))
+    del pristine_tests
+
+    os_write = os.write
+    os_close = os.close
+    orig_dup = os.dup
+    orig_dup2 = os.dup2
+    orig_fstat = os.fstat
+    sys_getframe = sys._getframe
+
+    def _guarded_write(fd: int, data: bytes) -> int:
+        if fd == report_fd:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        return os_write(fd, data)
+
+    def _guarded_close(fd: int) -> None:
+        if fd == report_fd:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        os_close(fd)
+
+    def _guarded_dup(fd: int) -> int:
+        if fd == report_fd:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        return orig_dup(fd)
+
+    def _guarded_dup2(fd: int, fd2: int, inheritable: bool = True) -> int:
+        if fd == report_fd or fd2 == report_fd:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        return orig_dup2(fd, fd2, inheritable=inheritable)
+
+    def _guarded_fstat(fd: int):
+        if fd == report_fd:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        return orig_fstat(fd)
+
+    os.write = posix.write = _guarded_write
+    os.close = posix.close = _guarded_close
+    os.dup = posix.dup = _guarded_dup
+    os.dup2 = posix.dup2 = _guarded_dup2
+    os.fstat = posix.fstat = _guarded_fstat
+
+    def _blocked_exit(status: int = 0) -> None:
+        raise SystemExit(status)
+
+    os._exit = posix._exit = _blocked_exit
+
+    def _blocked_gc(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("gc introspection is disabled in trusted test runner")
+
+    gc.get_objects = _blocked_gc
+    gc.get_referrers = _blocked_gc
+    gc.get_referents = _blocked_gc
+
+    class _TrustedPlugin:
+        def pytest_collectreport(self, report: object) -> None:
+            sys.audit("miniloop.collectreport", report)
+
+        def pytest_runtest_setup(self, item: object) -> None:
+            sys.audit("miniloop.verify_item", item)
+
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_call(self, item: object):
+            sys.audit("miniloop.verify_item", item)
+            yield
+            sys.audit("miniloop.verify_item", item)
+
+        def pytest_runtest_teardown(self, item: object) -> None:
+            sys.audit("miniloop.verify_item", item)
+
+        def pytest_runtest_logreport(self, report: object) -> None:
+            sys.audit("miniloop.logreport", report)
+
+    collect_code = _TrustedPlugin.pytest_collectreport.__code__
+    logreport_code = _TrustedPlugin.pytest_runtest_logreport.__code__
+    runner_co_filename = runner_code.co_filename
+
+    in_user_phase = True
+    internal_check = False
+    finalized = False
+    node_phases: dict[str, dict[str, str]] = {}
+    verified_counts: dict[str, int] = {}
+    failures = 0
+    errors = 0
+    skipped = 0
+    tampered = False
+
+    BLOCKED_EVENTS = frozenset(
+        {
+            "ctypes.dlopen",
+            "os.exec",
+            "os.spawn",
+            "os.posix_spawn",
+            "os.fork",
+            "os.forkpty",
+        }
+    )
+
+    def _has_workspace_frame_on_stack(start_frame: types.FrameType | None) -> bool:
+        f = start_frame
+        while f is not None:
+            raw_file = str(f.f_code.co_filename)
+            if not raw_file.startswith("<"):
+                co_file = os.path.realpath(raw_file)
+                if co_file == workspace_root or co_file.startswith(workspace_prefix):
+                    return True
+            f = f.f_back
+        return False
+
+    def _verify_item_code(item: object) -> None:
+        nonlocal tampered
+        nodeid = str(getattr(item, "nodeid", "")).replace("\\\\", "/")
+        base_nodeid = nodeid.split("[", 1)[0]
+        allowed_fps = pristine_code_map.get(base_nodeid)
+        if not allowed_fps:
+            tampered = True
+            raise RuntimeError(f"Unexpected test nodeid: {nodeid}")
+
+        fn = getattr(item, "obj", None)
+        if (
+            not isinstance(fn, types.FunctionType)
+            or _code_fingerprint(fn.__code__) not in allowed_fps
+        ):
+            tampered = True
+            raise RuntimeError(f"Tampered test function bytecode detected for {nodeid}")
+
+        mod = getattr(item, "module", None)
+        orig_name = str(getattr(item, "originalname", None) or getattr(item, "name", ""))
+        cls = getattr(item, "cls", None)
+        holder = cls if cls is not None else mod
+        if holder is not None and orig_name:
+            attr_fn = getattr(holder, orig_name, None)
+            if (
+                not isinstance(attr_fn, types.FunctionType)
+                or _code_fingerprint(attr_fn.__code__) not in allowed_fps
+            ):
+                tampered = True
+                raise RuntimeError(f"Tampered module test attribute detected for {nodeid}")
+        verified_counts[nodeid] = verified_counts.get(nodeid, 0) + 1
+
+    def _audit_hook(event: str, args: tuple[object, ...]) -> None:
+        nonlocal in_user_phase, internal_check, finalized, failures, errors, skipped, tampered
+        if internal_check or not in_user_phase:
+            return
+
+        if event == "miniloop.verify_item":
+            internal_check = True
+            try:
+                caller = sys_getframe(1)
+                if _has_workspace_frame_on_stack(caller):
+                    tampered = True
+                    raise RuntimeError("Unauthorized verify_item call from workspace")
+                _verify_item_code(args[0])
+            finally:
+                internal_check = False
+            return
+
+        if event == "miniloop.collectreport":
+            internal_check = True
+            try:
+                caller = sys_getframe(1)
+                if caller.f_code is not collect_code or _has_workspace_frame_on_stack(caller):
+                    tampered = True
+                    raise RuntimeError("Unauthorized collectreport call")
+                if getattr(args[0], "failed", False):
+                    errors += 1
+            finally:
+                internal_check = False
+            return
+
+        if event == "miniloop.logreport":
+            internal_check = True
+            try:
+                caller = sys_getframe(1)
+                if caller.f_code is not logreport_code or _has_workspace_frame_on_stack(caller):
+                    tampered = True
+                    raise RuntimeError("Unauthorized logreport call")
+                report = args[0]
+                nodeid = str(getattr(report, "nodeid", "")).replace("\\\\", "/")
+                when = str(getattr(report, "when", ""))
+                outcome = str(getattr(report, "outcome", ""))
+                if nodeid and when:
+                    node_phases.setdefault(nodeid, {})[when] = outcome
+                if outcome == "failed":
+                    if when == "call":
+                        failures += 1
+                    else:
+                        errors += 1
+                elif outcome == "skipped":
+                    skipped += 1
+            finally:
+                internal_check = False
+            return
+
+        if event == "miniloop.finalize":
+            internal_check = True
+            try:
+                caller = sys_getframe(1)
+                if (
+                    finalized
+                    or caller.f_code is not runner_code
+                    or (caller.f_back is not None and caller.f_back.f_back is not None)
+                ):
+                    tampered = True
+                    raise RuntimeError("Unauthorized finalize call")
+                finalized = True
+                in_user_phase = False
+                exit_code, had_exception = int(args[0]), bool(args[1])
+                if had_exception:
+                    errors += 1
+                if tampered:
+                    passed_nodeids: list[str] = []
+                    errors += 1
+                else:
+                    passed_nodeids = sorted(
+                        nid
+                        for nid, phases in node_phases.items()
+                        if phases.get("setup") == "passed"
+                        and phases.get("call") == "passed"
+                        and phases.get("teardown") == "passed"
+                        and verified_counts.get(nid, 0) >= 4
+                    )
+                report_bytes = json.dumps(
+                    {
+                        "nonce": nonce,
+                        "exit_code": exit_code,
+                        "passed_nodeids": passed_nodeids,
+                        "failures": failures,
+                        "errors": errors,
+                        "skipped": skipped,
+                        "tampered": tampered,
+                    }
+                ).encode("utf-8")
+                view = memoryview(report_bytes)
+                total_written = 0
+                while total_written < len(view):
+                    written = os_write(report_fd, view[total_written:])
+                    if written <= 0:
+                        break
+                    total_written += written
+                os_close(report_fd)
+            finally:
+                internal_check = False
+            return
+
+        if event == "sys._getframe":
+            if args and args[0] is not None:
+                target_frame = args[0]
+                co_file = getattr(getattr(target_frame, "f_code", None), "co_filename", "")
+                if (
+                    co_file == runner_co_filename
+                    or os.path.realpath(str(co_file)) in editable_abs_paths
+                ):
+                    raise RuntimeError("Audit hook blocked sys._getframe on protected frame")
+        elif event == "open":
+            if args:
+                target = args[0]
+                if isinstance(target, int):
+                    raise RuntimeError("Audit hook blocked opening raw file descriptor")
+                target_str = str(target)
+                if "/proc/" in target_str or "/dev/fd" in target_str:
+                    raise RuntimeError("Audit hook blocked procfs/devfd access")
+        elif event in BLOCKED_EVENTS:
+            raise RuntimeError(f"Audit hook blocked forbidden event: {event}")
+
+    sys.addaudithook(_audit_hook)
+    return _TrustedPlugin()
+
+
+def _run_trusted_pytest() -> int:
+    plugin = _bootstrap_sandbox(_run_trusted_pytest.__code__)
+    sys.modules["__main__"].__dict__.pop("_bootstrap_sandbox", None)
+    sys.modules["__main__"].__dict__.pop("_run_trusted_pytest", None)
+
+    had_exception = False
+    try:
+        raw_rc = pytest.main(sys.argv[1:], plugins=[plugin])
+        exit_code = int(raw_rc)
+    except SystemExit as exc:
+        exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+        had_exception = True
+    except BaseException:
+        exit_code = 1
+        had_exception = True
+
+    sys.audit("miniloop.finalize", exit_code, had_exception)
+    return exit_code
+
+
+raise SystemExit(_run_trusted_pytest())
+"""
+
+
+def _verify_trusted_pytest_report(
+    raw_report: str,
+    *,
+    expected_nonce: str,
+    expected_nodeids: set[str],
+    proc_returncode: int,
 ) -> bool:
-    """Verify external JUnit XML confirms all protected test files collected and passed."""
-    if not junit_path.is_file():
+    """Verify pipe report from trusted pytest bootstrap runner against expected nodeids."""
+    if not expected_nodeids or proc_returncode != 0 or not raw_report.strip():
         return False
     try:
-        root = ET.parse(junit_path).getroot()
-        if root.tag == "testsuite":
-            suites = [root]
-        elif root.tag == "testsuites":
-            suites = list(root.findall("testsuite"))
-        else:
-            return False
-
-        if not suites:
-            return False
-
-        total_tests = sum(int(s.attrib.get("tests", 0)) for s in suites)
-        total_failures = sum(int(s.attrib.get("failures", 0)) for s in suites)
-        total_errors = sum(int(s.attrib.get("errors", 0)) for s in suites)
-        total_skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
-        testcases = [tc for s in suites for tc in s.findall("testcase")]
-    except (ET.ParseError, OSError, ValueError):
+        payload = json.loads(raw_report)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
         return False
 
+    if payload.get("nonce") != expected_nonce:
+        return False
+    if payload.get("exit_code") != 0:
+        return False
     if (
-        total_tests <= 0
-        or len(testcases) != total_tests
-        or total_failures != 0
-        or total_errors != 0
-        or total_skipped != 0
+        payload.get("failures") != 0
+        or payload.get("errors") != 0
+        or payload.get("skipped") != 0
+        or payload.get("tampered") is not False
     ):
         return False
 
-    for tc in testcases:
-        for bad_tag in ("failure", "error", "skipped"):
-            if tc.find(bad_tag) is not None:
-                return False
+    passed_raw = payload.get("passed_nodeids")
+    if not isinstance(passed_raw, list) or not all(isinstance(x, str) for x in passed_raw):
+        return False
 
-    classnames = [tc.attrib.get("classname", "") for tc in testcases]
-    for rel_path in protected_test_files:
-        mod_full = Path(rel_path).with_suffix("").as_posix().replace("/", ".")
-        mod_stem = Path(rel_path).stem
-        if not any(
-            cn in {mod_full, mod_stem}
-            or cn.startswith(f"{mod_full}.")
-            or cn.startswith(f"{mod_stem}.")
-            for cn in classnames
-        ):
-            return False
-
-    return True
+    passed_set = set(passed_raw)
+    return expected_nodeids.issubset(passed_set) and len(passed_raw) == len(expected_nodeids)
 
 
 def evaluate_repaired_workspace(
@@ -371,15 +735,108 @@ def evaluate_repaired_workspace(
 
     pre_test_intact = _check_test_hashes(workspace_root, resolved_test_hashes)
     pre_only_allowed, _ = _inspect_workspace_files(case, workspace_root)
+    expected_nodeids = _extract_expected_test_nodeids(case)
 
     clean_env = _build_clean_test_env(workspace_root)
     timed_out = False
-    with tempfile.TemporaryDirectory(prefix="miniloop_eval_junit_") as tmp_dir:
-        junit_path = Path(tmp_dir) / "junit.xml"
-        cmd = list(case.test_command)
-        if cmd and Path(cmd[0]).name.startswith("pytest"):
-            cmd.append(f"--junitxml={junit_path}")
+    pytest_verified = False
 
+    cmd = list(case.test_command)
+    is_pytest = bool(cmd and Path(cmd[0]).name.startswith("pytest"))
+
+    if is_pytest:
+        nonce = secrets.token_hex(32)
+        read_fd, write_fd = os.pipe()
+        write_fd_closed = False
+        raw_report = ""
+
+        try:
+            bootstrap_payload = {
+                "nonce": nonce,
+                "report_fd": write_fd,
+                "workspace_root": str(workspace_root),
+                "editable_files": [Path(p).as_posix() for p in case.editable_files],
+                "pristine_tests": {
+                    Path(rel).as_posix(): (case.case_dir / Path(rel).as_posix()).read_text(
+                        encoding="utf-8"
+                    )
+                    for rel in case.protected_test_files
+                },
+            }
+            runner_cmd = [sys.executable, "-c", _TRUSTED_PYTEST_RUNNER_CODE, *cmd[1:]]
+            proc = subprocess.Popen(
+                runner_cmd,
+                cwd=workspace_root,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=clean_env,
+                pass_fds=(write_fd,),
+                start_new_session=True,
+            )
+            os.close(write_fd)
+            write_fd_closed = True
+        except OSError as exc:
+            exit_code = -1
+            test_output = f"Independent test execution failed to start: {exc}"
+            if not write_fd_closed:
+                os.close(write_fd)
+            os.close(read_fd)
+        else:
+            try:
+                try:
+                    stdout, stderr = proc.communicate(
+                        input=json.dumps(bootstrap_payload),
+                        timeout=timeout_sec,
+                    )
+                    exit_code = proc.returncode
+                    out_parts: list[str] = []
+                    if stdout:
+                        out_parts.append(stdout.rstrip())
+                    if stderr:
+                        out_parts.append(stderr.rstrip())
+                    test_output = "\n".join(out_parts).strip()
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    exit_code = -1
+                    test_output = (
+                        f"Independent test execution timed out after {timeout_sec:.2f}s"
+                    )
+                    _kill_process_group(proc.pid)
+                    proc.wait()
+            finally:
+                _kill_process_group(proc.pid)
+                proc.wait()
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+                try:
+                    if not timed_out:
+                        chunks: list[bytes] = []
+                        while True:
+                            chunk = os.read(read_fd, 65536)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                        raw_report = b"".join(chunks).decode("utf-8", errors="replace")
+                except OSError:
+                    raw_report = ""
+                finally:
+                    os.close(read_fd)
+
+            pytest_verified = _verify_trusted_pytest_report(
+                raw_report,
+                expected_nonce=nonce,
+                expected_nodeids=expected_nodeids,
+                proc_returncode=exit_code,
+            )
+    else:
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -400,7 +857,7 @@ def evaluate_repaired_workspace(
                 try:
                     stdout, stderr = proc.communicate(timeout=timeout_sec)
                     exit_code = proc.returncode
-                    out_parts: list[str] = []
+                    out_parts = []
                     if stdout:
                         out_parts.append(stdout.rstrip())
                     if stderr:
@@ -409,7 +866,9 @@ def evaluate_repaired_workspace(
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     exit_code = -1
-                    test_output = f"Independent test execution timed out after {timeout_sec:.2f}s"
+                    test_output = (
+                        f"Independent test execution timed out after {timeout_sec:.2f}s"
+                    )
                     _kill_process_group(proc.pid)
                     proc.wait()
             finally:
@@ -420,8 +879,6 @@ def evaluate_repaired_workspace(
                 if proc.stderr is not None:
                     proc.stderr.close()
 
-        junit_verified = _verify_junit_xml(junit_path, case.protected_test_files)
-
     post_test_intact = _check_test_hashes(workspace_root, resolved_test_hashes)
     test_files_intact = pre_test_intact and post_test_intact
 
@@ -431,7 +888,7 @@ def evaluate_repaired_workspace(
     tests_passed = (
         not timed_out
         and exit_code == 0
-        and junit_verified
+        and pytest_verified
     )
 
     repair_succeeded = bool(

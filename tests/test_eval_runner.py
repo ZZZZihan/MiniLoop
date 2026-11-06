@@ -254,20 +254,100 @@ def test_cli_eval_fake_and_missing_real_config_rejection(
     assert bad_code == 1
 
 
-def test_import_time_os_exit_spoofing_passed_stdout_is_rejected(tmp_path: Path) -> None:
-    """Verify source code spoofing '1 passed' and calling os._exit(0) fails JUnit XML check."""
+def test_import_time_os_exit_and_fd_pipe_spoofing_is_rejected(tmp_path: Path) -> None:
+    """Verify source scanning sys.argv/os.environ/FDs 3..63 and calling os._exit(0) is rejected."""
     case = load_cases(split="dev")[0]
     ws_dir = tmp_path / "spoof_exit_ws"
     expected_hashes = prepare_isolated_workspace(case, ws_dir)
 
     src_file = ws_dir / case.reference_fix.path
     src_file.write_text(
-        'import os, sys\nprint("1 passed", flush=True)\nos._exit(0)\n',
+        "import gc, json, os, sys\n"
+        "for arg in sys.argv:\n"
+        "    if '--junitxml=' in arg:\n"
+        "        p = arg.split('=', 1)[1]\n"
+        "        xml = '<testsuite tests=\"5\" failures=\"0\" errors=\"0\" skipped=\"0\"/>'\n"
+        "        open(p, 'w').write(xml)\n"
+        "stolen_nonce = os.environ.get('NONCE', '')\n"
+        "try:\n"
+        "    1 / 0\n"
+        "except ZeroDivisionError as exc:\n"
+        "    f = exc.__traceback__.tb_frame\n"
+        "    while f is not None:\n"
+        "        if 'nonce' in f.f_locals:\n"
+        "            stolen_nonce = str(f.f_locals['nonce'])\n"
+        "        f = f.f_back\n"
+        "try:\n"
+        "    for obj in gc.get_objects():\n"
+        "        if isinstance(obj, dict) and 'nonce' in obj:\n"
+        "            stolen_nonce = str(obj['nonce'])\n"
+        "except Exception:\n"
+        "    pass\n"
+        "fake_report = json.dumps({\n"
+        "    'nonce': stolen_nonce,\n"
+        "    'exit_code': 0,\n"
+        "    'passed_nodeids': [\n"
+        "        'tests/test_paginator.py::test_first_page_returns_initial_slice',\n"
+        "        'tests/test_paginator.py::test_middle_and_tail_pages',\n"
+        "        'tests/test_paginator.py::test_page_beyond_end_returns_empty_list',\n"
+        "        'tests/test_paginator.py::test_single_item_pages_cover_entire_sequence',\n"
+        "        'tests/test_paginator.py::test_invalid_page_or_page_size_raises_value_error',\n"
+        "    ],\n"
+        "    'failures': 0,\n"
+        "    'errors': 0,\n"
+        "    'skipped': 0,\n"
+        "    'tampered': False,\n"
+        "}).encode('utf-8')\n"
+        "for fd in range(3, 64):\n"
+        "    for fn in (\n"
+        "        lambda d=fd: os.write(d, fake_report),\n"
+        "        lambda d=fd: open(f'/proc/self/fd/{d}', 'wb').write(fake_report),\n"
+        "    ):\n"
+        "        try:\n"
+        "            fn()\n"
+        "        except Exception:\n"
+        "            pass\n"
+        'print("5 passed", flush=True)\n'
+        "os._exit(0)\n",
         encoding="utf-8",
     )
 
     verdict = evaluate_repaired_workspace(case, ws_dir, expected_hashes)
-    assert verdict.exit_code == 0
+    assert verdict.tests_passed is False
+    assert verdict.repair_succeeded is False
+    assert verdict.failure_reason == "tests_failed"
+
+
+def test_import_time_monkeypatch_of_test_module_functions_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verify monkeypatching test functions in sys.modules['tests.test_paginator'] is rejected."""
+    case = load_cases(split="dev")[0]
+    ws_dir = tmp_path / "monkeypatch_test_ws"
+    expected_hashes = prepare_isolated_workspace(case, ws_dir)
+
+    src_file = ws_dir / case.reference_fix.path
+    src_file.write_text(
+        "import sys, types\n"
+        "class _HookedTestModule(types.ModuleType):\n"
+        "    def __setattr__(self, name, value):\n"
+        "        if name.startswith('test_') and callable(value):\n"
+        "            value = lambda: None\n"
+        "        super().__setattr__(name, value)\n"
+        "mod = sys.modules.get('tests.test_paginator')\n"
+        "if mod is not None:\n"
+        "    mod.__class__ = _HookedTestModule\n"
+        "def paginate(items, page, page_size):\n"
+        "    mod = sys.modules.get('tests.test_paginator')\n"
+        "    if mod is not None:\n"
+        "        for attr in list( vars(mod) ):\n"
+        "            if attr.startswith('test_'):\n"
+        "                setattr(mod, attr, lambda: None)\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+
+    verdict = evaluate_repaired_workspace(case, ws_dir, expected_hashes)
     assert verdict.tests_passed is False
     assert verdict.repair_succeeded is False
     assert verdict.failure_reason == "tests_failed"
